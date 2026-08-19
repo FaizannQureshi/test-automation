@@ -1171,16 +1171,101 @@ def status_color(status: str) -> str:
     return {"On track": "#059669", "Watch": "#D97706", "Fix": "#DC2626"}.get(status, "#64748B")
 
 
-def score_bar(label: str, score: int, desc: str) -> str:
-    color = "#059669" if score >= 70 else ("#D97706" if score >= 40 else "#DC2626")
-    return f"""
-<div style="margin:0 0 16px;">
-<p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#0F172A;">{esc(label)}</p>
-<p style="margin:0 0 8px;font-size:12px;color:#64748B;line-height:1.45;">{esc(desc)}</p>
-<div style="background:#E2E8F0;border-radius:6px;height:10px;overflow:hidden;">
-<div style="width:{score}%;background:{color};height:10px;border-radius:6px;"></div>
+# ---------------------------------------------------------------------------
+# NOTE on inline styling constraints
+# ---------------------------------------------------------------------------
+# The Admin → Reports RICH_TEXT renderer sanitizes inline `style` attributes
+# down to a narrow allowlist before it ever reaches the client portal. Verified
+# by inspecting the rendered DOM of a published report:
+#   survives : color, background (solid hex only — gradients/rgba are
+#              dropped), font-family, font-size, font-weight, line-height,
+#              letter-spacing, text-align, width, height, min-width,
+#              max-width, padding (shorthand), border (shorthand, all sides),
+#              border-radius, border-collapse
+#   stripped : margin (all variants), display (no flex/grid/inline-block),
+#              text-transform, list-style, float, single-side borders
+#              (border-left/right/top/bottom), background-image/gradient
+# Every helper below is written to stay inside the surviving set only:
+#  - vertical spacing uses explicit spacer() divs, never margin
+#  - multi-column layout uses <table> (rows/cols survive display:flex loss)
+#  - "uppercase" labels are written as literal uppercase text, not CSS
+#  - accent bars use a colored table cell instead of border-left
+#  - table row separators use full `border` + zebra background instead of
+#    border-bottom
+
+
+def spacer(px: int) -> str:
+    return f'<div style="height:{px}px;"></div>'
+
+
+def score_tier_color(score: int) -> str:
+    return "#059669" if score >= 70 else ("#D97706" if score >= 40 else "#DC2626")
+
+
+def score_card(label: str, score: int, desc: str) -> str:
+    color = score_tier_color(score)
+    return f"""<table style="width:100%;border-collapse:collapse;">
+<tr>
+<td style="padding:0;color:#F1F5F9;font-size:14px;font-weight:700;">{esc(label)}</td>
+<td style="padding:0;color:{color};font-size:22px;font-weight:800;text-align:right;">{score}</td>
+</tr>
+</table>
+{spacer(6)}
+<p style="padding:0;font-size:12px;color:#94A3B8;line-height:1.45;">{esc(desc)}</p>
+{spacer(10)}
+<div style="height:8px;background:#1E293B;border-radius:6px;">
+<div style="height:8px;width:{score}%;background:{color};border-radius:6px;"></div>
 </div>
-<p style="margin:6px 0 0;font-size:13px;color:#334155;">Score out of 100: <strong>{score}</strong></p>
+{spacer(6)}
+<p style="padding:0;font-size:11px;color:#64748B;letter-spacing:0.06em;">SCORE OUT OF 100</p>"""
+
+
+def score_cards_row(cards: list[tuple[str, int, str]]) -> str:
+    tds = "".join(
+        f'<td style="width:{100 // len(cards)}%;padding:14px;">{score_card(l, s, d)}</td>'
+        for l, s, d in cards
+    )
+    return f'<table style="width:100%;border-collapse:collapse;"><tr>{tds}</tr></table>'
+
+
+def overall_badge(overall: int) -> str:
+    color = score_tier_color(overall)
+    size = 168
+    return f"""<div style="width:{size}px;height:{size}px;border:10px solid {color};border-radius:999px;background:#0B1220;text-align:center;line-height:{size}px;">
+<span style="font-size:40px;font-weight:800;color:#F8FAFC;">{overall}</span><span style="font-size:15px;color:#94A3B8;">/100</span>
+</div>
+{spacer(10)}
+<p style="text-align:center;font-size:12px;color:#94A3B8;letter-spacing:0.06em;">OVERALL</p>"""
+
+
+def scores_section(scores: dict, overall: int) -> str:
+    channel_cards = score_cards_row(
+        [
+            ("Search", scores.get("search", 0), "Whether search engines can find and rank your pages for the work you sell."),
+            ("Listings", scores.get("listings", 0), "Google Business Profile, map pin, and name-address-phone consistency."),
+            ("AI answers", scores.get("ai_answers", 0), "Whether Gemini names or cites you on buyer questions in your category."),
+        ]
+    )
+    website_cards = score_cards_row(
+        [
+            ("Site health", scores.get("site_health", 0), "Page speed, HTTPS, and whether key URLs load cleanly on mobile."),
+            ("Content", scores.get("content", 0), "Unique copy, meta tags, headings, and proof on key pages."),
+            ("Structure", scores.get("structure", 0), "Sitemaps, canonicals, schema, and information architecture."),
+        ]
+    )
+    return f"""<div style="background:#0B1220;border:1px solid #1E293B;border-radius:16px;padding:24px;">
+<table style="width:100%;border-collapse:collapse;">
+<tr>
+<td style="width:200px;padding:0 20px 0 0;">{overall_badge(overall)}</td>
+<td style="padding:0;">
+<p style="padding:0 0 10px;font-size:12px;color:#64748B;letter-spacing:0.08em;">CHANNELS</p>
+{channel_cards}
+</td>
+</tr>
+</table>
+{spacer(18)}
+<p style="padding:0 0 10px;font-size:12px;color:#64748B;letter-spacing:0.08em;">WEBSITE</p>
+{website_cards}
 </div>"""
 
 
@@ -1192,63 +1277,85 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
     scores = audit["scores"]
     prepared = TODAY.strftime("%b %d, %Y")
 
-    glance_rows = ""
-    for m in audit.get("at_a_glance") or []:
-        st = m.get("status") or "Watch"
-        glance_rows += f"""
-<div style="padding:14px 16px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;margin:0 0 10px;">
-<p style="margin:0 0 4px;font-size:13px;color:#64748B;">{esc(m.get('label'))}</p>
-<p style="margin:0 0 6px;font-size:22px;font-weight:700;color:#0F172A;">{esc(m.get('value'))}</p>
-<span style="display:inline-block;padding:3px 10px;font-size:11px;font-weight:700;border-radius:999px;color:#FFF;background:{status_color(st)};">{esc(st)}</span>
-<p style="margin:8px 0 0;font-size:12px;color:#64748B;line-height:1.4;">{esc(m.get('note'))}</p>
-</div>"""
+    glance_cards = ""
+    glance = audit.get("at_a_glance") or []
+    for i in range(0, len(glance), 2):
+        pair = glance[i : i + 2]
+        cells = ""
+        for m in pair:
+            st = m.get("status") or "Watch"
+            cells += f"""<td style="width:50%;padding:8px;">
+<div style="padding:14px 16px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;">
+<p style="padding:0 0 4px;font-size:13px;color:#64748B;">{esc(m.get('label'))}</p>
+<p style="padding:0 0 6px;font-size:22px;font-weight:700;color:#0F172A;">{esc(m.get('value'))}</p>
+<span style="padding:3px 10px;font-size:11px;font-weight:700;border-radius:999px;color:#FFF;background:{status_color(st)};">{esc(st)}</span>
+<p style="padding:8px 0 0;font-size:12px;color:#64748B;line-height:1.4;">{esc(m.get('note'))}</p>
+</div>
+</td>"""
+        if len(pair) == 1:
+            cells += '<td style="width:50%;padding:8px;"></td>'
+        glance_cards += f'<table style="width:100%;border-collapse:collapse;"><tr>{cells}</tr></table>'
 
     facts = ""
-    for f in audit.get("other_facts") or []:
+    other_facts = audit.get("other_facts") or []
+    for i, f in enumerate(other_facts):
         st = f.get("status") or "Watch"
-        facts += f"""
-<li style="margin:0 0 10px;list-style:none;padding:12px 14px;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;">
+        facts += f"""<div style="padding:12px 14px;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;">
 <strong style="color:#0F172A;">{esc(f.get('label'))}</strong>
-<span style="margin-left:8px;padding:2px 8px;font-size:11px;font-weight:700;border-radius:999px;color:#FFF;background:{status_color(st)};">{esc(st)}</span>
-<p style="margin:6px 0 0;font-size:13px;color:#475569;">{esc(f.get('detail'))}</p>
-</li>"""
+<span style="padding:2px 8px;font-size:11px;font-weight:700;border-radius:999px;color:#FFF;background:{status_color(st)};">{esc(st)}</span>
+<p style="padding:6px 0 0;font-size:13px;color:#475569;">{esc(f.get('detail'))}</p>
+</div>"""
+        if i < len(other_facts) - 1:
+            facts += spacer(10)
 
     offers = ""
-    for o in audit.get("offers") or []:
+    offer_list = audit.get("offers") or []
+    for i, o in enumerate(offer_list):
         sc = o.get("score")
-        bar = f'<span style="color:#94A3B8;">{sc}</span>' if sc is not None else ""
-        offers += f"""
-<div style="margin:0 0 8px;padding:10px 12px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:8px;">
-<strong style="color:#0F172A;">{esc(o.get('name'))}</strong> {bar}
-<span style="float:right;font-size:12px;color:#64748B;">{esc(o.get('kind'))}</span>
-</div>"""
+        sc_cell = f'<span style="color:#94A3B8;">{sc}</span>' if sc is not None else ""
+        offers += f"""<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:8px;">
+<tr>
+<td style="padding:10px 12px;"><strong style="color:#0F172A;">{esc(o.get('name'))}</strong> {sc_cell}</td>
+<td style="padding:10px 12px;text-align:right;font-size:12px;color:#64748B;">{esc(o.get('kind'))}</td>
+</tr>
+</table>"""
+        if i < len(offer_list) - 1:
+            offers += spacer(8)
 
     search_rows = ""
     for idx, o in enumerate(audit.get("search_observations") or [], 1):
         sc = o.get("score") or 0
-        search_rows += f"""
-<tr>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#64748B;font-size:13px;">{idx:02d}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#0F172A;font-weight:600;">{esc(o.get('query'))}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#0F172A;font-weight:700;">{sc}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#475569;font-size:13px;">{esc(o.get('note'))}</td>
+        bg = "#FFFFFF" if idx % 2 else "#F8FAFC"
+        search_rows += f"""<tr style="background:{bg};">
+<td style="padding:10px 12px;color:#64748B;font-size:13px;">{idx:02d}</td>
+<td style="padding:10px 12px;color:#0F172A;font-weight:600;">{esc(o.get('query'))}</td>
+<td style="padding:10px 12px;color:#0F172A;font-weight:700;">{sc}</td>
+<td style="padding:10px 12px;color:#475569;font-size:13px;">{esc(o.get('note'))}</td>
 </tr>"""
 
     improve_blocks = ""
-    for imp in audit.get("improvements") or []:
+    improvements = audit.get("improvements") or []
+    for i, imp in enumerate(improvements):
         pages = "".join(
-            f'<li style="margin:0 0 4px;"><a href="{esc(p)}" style="color:#2563EB;">{esc(p)}</a></li>'
+            f'<p style="padding:0 0 4px;font-size:13px;"><a href="{esc(p)}" style="color:#2563EB;">{esc(p)}</a></p>'
             for p in imp.get("pages") or []
         )
-        improve_blocks += f"""
-<div style="margin:0 0 14px;padding:16px 18px;background:#FFFFFF;border:1px solid #E2E8F0;border-left:4px solid #2563EB;border-radius:8px;">
-<p style="margin:0 0 4px;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#2563EB;">{esc(imp.get('category'))} · {esc(imp.get('priority'))}</p>
-<h3 style="margin:0 0 8px;font-size:16px;color:#0F172A;">{esc(imp.get('title'))}</h3>
-<p style="margin:0 0 10px;font-size:14px;color:#475569;line-height:1.5;">{esc(imp.get('finding'))}</p>
-<p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#0F172A;text-transform:uppercase;letter-spacing:0.04em;">What we recommend</p>
-<p style="margin:0 0 10px;font-size:14px;color:#334155;line-height:1.5;">{esc(imp.get('recommendation'))}</p>
-<ul style="margin:0;padding-left:18px;font-size:13px;">{pages}</ul>
-</div>"""
+        category_line = f"{esc(imp.get('category', '')).upper()} · {esc(imp.get('priority', '')).upper()}"
+        improve_blocks += f"""<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:8px;">
+<tr>
+<td style="width:4px;padding:0;background:#2563EB;"></td>
+<td style="padding:16px 18px;">
+<p style="padding:0 0 4px;font-size:11px;font-weight:700;letter-spacing:0.06em;color:#2563EB;">{category_line}</p>
+<h3 style="padding:0 0 8px;font-size:16px;color:#0F172A;">{esc(imp.get('title'))}</h3>
+<p style="padding:0 0 10px;font-size:14px;color:#475569;line-height:1.5;">{esc(imp.get('finding'))}</p>
+<p style="padding:0 0 6px;font-size:12px;font-weight:700;color:#0F172A;letter-spacing:0.04em;">WHAT WE RECOMMEND</p>
+<p style="padding:0 0 10px;font-size:14px;color:#334155;line-height:1.5;">{esc(imp.get('recommendation'))}</p>
+{pages}
+</td>
+</tr>
+</table>"""
+        if i < len(improvements) - 1:
+            improve_blocks += spacer(14)
 
     comp_rows = ""
     for idx, c in enumerate(audit.get("competitors") or [], 1):
@@ -1258,76 +1365,74 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
             if link
             else esc(c.get("name"))
         )
-        comp_rows += f"""
-<tr>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;">{idx:02d}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;">{name_cell}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#475569;">{esc(c.get('site'))}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#64748B;font-size:13px;">{esc(c.get('notes'))}</td>
+        bg = "#FFFFFF" if idx % 2 else "#F8FAFC"
+        comp_rows += f"""<tr style="background:{bg};">
+<td style="padding:10px 12px;">{idx:02d}</td>
+<td style="padding:10px 12px;">{name_cell}</td>
+<td style="padding:10px 12px;color:#475569;">{esc(c.get('site'))}</td>
+<td style="padding:10px 12px;color:#64748B;font-size:13px;">{esc(c.get('notes'))}</td>
 </tr>"""
 
     steps = ""
-    for s in audit.get("next_steps") or []:
-        steps += f"""
-<div style="display:flex;gap:14px;margin:0 0 12px;padding:14px 16px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;">
-<div style="min-width:36px;font-size:18px;font-weight:700;color:#94A3B8;">{s.get('rank', 0):02d}</div>
-<div>
-<p style="margin:0 0 4px;font-size:11px;font-weight:700;color:#2563EB;">{esc(s.get('badge'))} · {esc(s.get('effort'))}</p>
-<h3 style="margin:0 0 6px;font-size:15px;color:#0F172A;">{esc(s.get('title'))}</h3>
-<p style="margin:0;font-size:13px;color:#475569;line-height:1.45;">{esc(s.get('detail'))}</p>
-</div>
-</div>"""
+    next_steps = audit.get("next_steps") or []
+    for i, s in enumerate(next_steps):
+        steps += f"""<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;">
+<tr>
+<td style="width:40px;padding:14px 0 14px 16px;font-size:18px;font-weight:700;color:#94A3B8;">{s.get('rank', 0):02d}</td>
+<td style="padding:14px 16px;">
+<p style="padding:0 0 4px;font-size:11px;font-weight:700;color:#2563EB;">{esc(s.get('badge'))} · {esc(s.get('effort'))}</p>
+<h3 style="padding:0 0 6px;font-size:15px;color:#0F172A;">{esc(s.get('title'))}</h3>
+<p style="padding:0;font-size:13px;color:#475569;line-height:1.45;">{esc(s.get('detail'))}</p>
+</td>
+</tr>
+</table>"""
+        if i < len(next_steps) - 1:
+            steps += spacer(12)
 
     unreachable = ""
     if not audit.get("reachable"):
-        unreachable = f"""
-<p style="margin:0 0 16px;padding:12px 14px;background:#FEE2E2;color:#991B1B;border:1px solid #FECACA;border-radius:8px;">
-<strong>Site unreachable.</strong> Could not fully load {esc(site)}. Scores reflect partial data.</p>"""
+        unreachable = f"""<div style="padding:12px 14px;background:#FEE2E2;color:#991B1B;border:1px solid #FECACA;border-radius:8px;">
+<strong>Site unreachable.</strong> Could not fully load {esc(site)}. Scores reflect partial data.</div>
+{spacer(16)}"""
 
-    section = "margin:0 0 28px;padding:0 28px;"
-    h2 = "margin:0 0 14px;font-size:18px;font-weight:700;color:#0F172A;"
+    section_pad = "padding:0 28px;"
+    h2 = "padding:0 0 14px;font-size:18px;font-weight:700;color:#0F172A;"
 
-    return f"""<div style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0F172A;background:#F1F5F9;line-height:1.5;">
-<header style="background:linear-gradient(135deg,#0F172A 0%,#1E3A5F 100%);color:#FFFFFF;padding:32px 28px 28px;">
-<p style="margin:0 0 6px;font-size:12px;letter-spacing:0.1em;text-transform:uppercase;color:#93C5FD;">Private AI and search snapshot · Connection Inc</p>
-<h1 style="margin:0 0 10px;font-size:28px;line-height:1.2;color:#FFFFFF;">How visible is {esc(brand)}?</h1>
-<p style="margin:0 0 16px;font-size:15px;color:#CBD5E1;max-width:720px;line-height:1.55;">{esc(audit.get('opportunity'))}</p>
-<p style="margin:0;font-size:13px;color:#94A3B8;">Prepared on {esc(prepared)} · Website <a href="{esc(site)}" style="color:#93C5FD;">{esc(host)}</a></p>
-</header>
+    return f"""<div style="padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0F172A;background:#F1F5F9;line-height:1.5;">
+<div style="background:#0B1220;color:#FFFFFF;padding:32px 28px 28px;">
+<p style="padding:0 0 6px;font-size:12px;letter-spacing:0.1em;color:#93C5FD;">PRIVATE AI AND SEARCH SNAPSHOT · CONNECTION INC</p>
+<h1 style="padding:0 0 10px;font-size:28px;line-height:1.2;color:#FFFFFF;">How visible is {esc(brand)}?</h1>
+<p style="padding:0 0 16px;font-size:15px;color:#CBD5E1;max-width:720px;line-height:1.55;">{esc(audit.get('opportunity'))}</p>
+<p style="padding:0;font-size:13px;color:#94A3B8;">Prepared on {esc(prepared)} · Website <a href="{esc(site)}" style="color:#93C5FD;">{esc(host)}</a></p>
+</div>
+<div style="height:4px;background:#2563EB;"></div>
+{spacer(24)}
+<div style="{section_pad}">
 {unreachable}
-<section style="{section}padding-top:24px;">
 <h2 style="{h2}">Scores</h2>
-<div style="display:flex;flex-wrap:wrap;gap:16px;margin:0 0 20px;">
-<div style="flex:1;min-width:140px;padding:20px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;text-align:center;">
-<p style="margin:0;font-size:36px;font-weight:800;color:#0F172A;">{overall}<span style="font-size:16px;color:#64748B;">/100</span></p>
-<p style="margin:4px 0 0;font-size:13px;color:#64748B;">Overall</p>
+<p style="padding:0 0 16px;font-size:13px;color:#64748B;">Channels are how people discover you. Site scores are how ready the website is when they arrive.</p>
+{scores_section(scores, overall)}
 </div>
-</div>
-<h3 style="margin:0 0 10px;font-size:14px;font-weight:700;color:#64748B;text-transform:uppercase;letter-spacing:0.05em;">Channels</h3>
-{score_bar("Search", scores.get("search", 0), "Whether search engines can find and rank your pages for the work you sell.")}
-{score_bar("Listings", scores.get("listings", 0), "Google Business Profile, map pin, and name-address-phone consistency.")}
-{score_bar("AI answers", scores.get("ai_answers", 0), "Whether Gemini names or cites you on buyer questions in your category.")}
-<h3 style="margin:16px 0 10px;font-size:14px;font-weight:700;color:#64748B;text-transform:uppercase;letter-spacing:0.05em;">Website</h3>
-{score_bar("Site health", scores.get("site_health", 0), "Page speed, HTTPS, and whether key URLs load cleanly on mobile.")}
-{score_bar("Content", scores.get("content", 0), "Unique copy, meta tags, headings, and proof on key pages.")}
-{score_bar("Structure", scores.get("structure", 0), "Sitemaps, canonicals, schema, and information architecture.")}
-</section>
-<section style="{section}">
+{spacer(28)}
+<div style="{section_pad}">
 <h2 style="{h2}">Facts · At a glance</h2>
-{glance_rows}
-<h3 style="margin:16px 0 10px;font-size:14px;font-weight:700;color:#64748B;">Other facts</h3>
-<ul style="margin:0;padding:0;">{facts}</ul>
-</section>
-<section style="{section}">
+{glance_cards}
+{spacer(6)}
+<h3 style="padding:16px 0 10px;font-size:14px;font-weight:700;color:#64748B;">Other facts</h3>
+{facts}
+</div>
+{spacer(28)}
+<div style="{section_pad}">
 <h2 style="{h2}">Offers · What you offer</h2>
-<p style="margin:0 0 12px;font-size:13px;color:#64748B;">Services and products found on the live site.</p>
+<p style="padding:0 0 12px;font-size:13px;color:#64748B;">Services and products found on the live site.</p>
 {offers or '<p style="color:#64748B;">No service headings detected on the homepage.</p>'}
-</section>
-<section style="{section}">
+</div>
+{spacer(28)}
+<div style="{section_pad}">
 <h2 style="{h2}">Search · Where you show up</h2>
-<p style="margin:0 0 12px;font-size:13px;color:#64748B;">Search observations from this snapshot — sample ranks, not Search Console history.</p>
-<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;overflow:hidden;font-size:14px;">
-<thead><tr style="background:#F8FAFC;">
+<p style="padding:0 0 12px;font-size:13px;color:#64748B;">Search observations from this snapshot — sample ranks, not Search Console history.</p>
+<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;font-size:14px;">
+<thead><tr style="background:#F1F5F9;">
 <th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">#</th>
 <th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Query</th>
 <th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Score</th>
@@ -1335,16 +1440,18 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
 </tr></thead>
 <tbody>{search_rows}</tbody>
 </table>
-</section>
-<section style="{section}">
+</div>
+{spacer(28)}
+<div style="{section_pad}">
 <h2 style="{h2}">Improve · What to improve</h2>
 {improve_blocks or '<p style="color:#64748B;">No critical improvements flagged this week.</p>'}
-</section>
-<section style="{section}">
+</div>
+{spacer(28)}
+<div style="{section_pad}">
 <h2 style="{h2}">Compare · How you compare</h2>
-<p style="margin:0 0 12px;font-size:13px;color:#64748B;">Firms observed in the same sampled searches and AI answers.</p>
-<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;overflow:hidden;font-size:14px;">
-<thead><tr style="background:#F8FAFC;">
+<p style="padding:0 0 12px;font-size:13px;color:#64748B;">Firms observed in the same sampled searches and AI answers.</p>
+<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;font-size:14px;">
+<thead><tr style="background:#F1F5F9;">
 <th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">#</th>
 <th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Company</th>
 <th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Site</th>
@@ -1352,15 +1459,17 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
 </tr></thead>
 <tbody>{comp_rows or '<tr><td colspan="4" style="padding:12px;color:#64748B;">No competitors observed in this sample.</td></tr>'}</tbody>
 </table>
-</section>
-<section style="{section}padding-bottom:32px;">
+</div>
+{spacer(28)}
+<div style="{section_pad}">
 <h2 style="{h2}">Next · Your next steps</h2>
-<p style="margin:0 0 14px;font-size:13px;color:#64748B;">Work from the top for the fastest lift.</p>
+<p style="padding:0 0 14px;font-size:13px;color:#64748B;">Work from the top for the fastest lift.</p>
 {steps}
-</section>
-<footer style="padding:16px 28px 28px;border-top:1px solid #E2E8F0;background:#FFFFFF;">
-<p style="margin:0;font-size:12px;color:#64748B;line-height:1.5;">Private AI and search snapshot for {esc(client_name)}. Generated {esc(REPORT_DATE)} by Connection Inc weekly automation. Search observations use Gemini with Google Search grounding — sample-based, not guaranteed Google positions. Connect Search Console and Analytics for historical data.</p>
-</footer>
+</div>
+{spacer(20)}
+<div style="border:1px solid #E2E8F0;background:#FFFFFF;padding:16px 28px;">
+<p style="padding:0;font-size:12px;color:#64748B;line-height:1.5;">Private AI and search snapshot for {esc(client_name)}. Generated {esc(REPORT_DATE)} by Connection Inc weekly automation. Search observations use Gemini with Google Search grounding — sample-based, not guaranteed Google positions. Connect Search Console and Analytics for historical data.</p>
+</div>
 </div>"""
 
 
