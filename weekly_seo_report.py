@@ -80,12 +80,46 @@ def cse_id() -> str:
     return env("GOOGLE_CSE_ID", "GOOGLE_CUSTOM_SEARCH_ENGINE_ID")
 
 
+def gsc_secret() -> str:
+    return env(
+        "search_console_api",
+        "SEARCH_CONSOLE_API",
+        "GOOGLE_SEARCH_CONSOLE_CREDENTIALS_JSON",
+        "GSC_CREDENTIALS_JSON",
+    )
+
+
+def ga_secret() -> str:
+    return env(
+        "analytics_data_api",
+        "ANALYTICS_DATA_API",
+        "GOOGLE_ANALYTICS_CREDENTIALS_JSON",
+        "GA_CREDENTIALS_JSON",
+    )
+
+
+def analytics_property_id() -> str:
+    raw = env(
+        "analytics_property_id",
+        "GOOGLE_ANALYTICS_PROPERTY_ID",
+        "GA4_PROPERTY_ID",
+    )
+    if not raw:
+        return ""
+    raw = raw.strip()
+    if raw.isdigit():
+        return f"properties/{raw}"
+    if not raw.startswith("properties/"):
+        return f"properties/{raw}"
+    return raw
+
+
 def gsc_configured() -> bool:
-    return bool(env("GOOGLE_SEARCH_CONSOLE_CREDENTIALS_JSON", "GSC_CREDENTIALS_JSON"))
+    return bool(gsc_secret())
 
 
 def ga_configured() -> bool:
-    return bool(env("GOOGLE_ANALYTICS_PROPERTY_ID", "GA4_PROPERTY_ID"))
+    return bool(ga_secret()) and bool(analytics_property_id())
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +626,200 @@ def gemini_ask(prompt: str, *, use_search: bool = False) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200], "text": "", "grounding_urls": []}
 
 
+# ---------------------------------------------------------------------------
+# Search Console + Google Analytics (OAuth via secret — API key or service account JSON)
+# ---------------------------------------------------------------------------
+
+GSC_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
+GA_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+
+
+def _access_token_for_secret(secret: str, scopes: list[str]) -> tuple[str | None, str | None]:
+    """Obtain a bearer token from search_console_api / analytics_data_api secret."""
+    secret = (secret or "").strip()
+    if not secret:
+        return None, "secret not set"
+
+    # Service account JSON stored in the Runtime Secret
+    if secret.startswith("{"):
+        try:
+            info = json.loads(secret)
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+
+            creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+            creds.refresh(GoogleAuthRequest())
+            return creds.token, None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {str(e)[:160]}"
+
+    # Plain GCP API key — Google does not accept API keys alone for GSC / GA4 data access.
+    return (
+        None,
+        "Plain API keys are not supported for Search Console / Analytics data. "
+        "Store service account JSON in search_console_api / analytics_data_api, "
+        "and grant that service account access to the property.",
+    )
+
+
+def gsc_site_url_candidates(site_url: str) -> list[str]:
+    host = site_host(site_url)
+    parsed = urlparse(site_url)
+    base_https = urlunparse(("https", parsed.netloc.lower(), "/", "", "", ""))
+    candidates = [
+        f"sc-domain:{host}",
+        base_https,
+        f"https://{host}/",
+        f"https://www.{host}/",
+        site_url.rstrip("/") + "/",
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def fetch_search_console(site_url: str) -> dict:
+    secret = gsc_secret()
+    if not secret:
+        return {"ok": False, "error": "search_console_api not set", "queries": []}
+    token, err = _access_token_for_secret(secret, [GSC_SCOPE])
+    if not token:
+        return {"ok": False, "error": err or "auth failed", "queries": []}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        sites_resp = requests.get(
+            "https://www.googleapis.com/webmasters/v3/sites",
+            headers=headers,
+            timeout=30,
+        )
+        if sites_resp.status_code != 200:
+            return {
+                "ok": False,
+                "error": f"sites list HTTP {sites_resp.status_code}",
+                "queries": [],
+            }
+        site_entries = sites_resp.json().get("siteEntry") or []
+        permitted = {e.get("siteUrl") for e in site_entries if e.get("siteUrl")}
+        chosen = None
+        for candidate in gsc_site_url_candidates(site_url):
+            if candidate in permitted:
+                chosen = candidate
+                break
+        if not chosen and permitted:
+            host = site_host(site_url)
+            for p in permitted:
+                if host in p:
+                    chosen = p
+                    break
+        if not chosen:
+            return {
+                "ok": False,
+                "error": "No matching Search Console property for this site URL",
+                "queries": [],
+            }
+        end = TODAY - timedelta(days=1)
+        start = end - timedelta(days=27)
+        body = {
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
+            "dimensions": ["query"],
+            "rowLimit": 15,
+        }
+        q_resp = requests.post(
+            f"https://www.googleapis.com/webmasters/v3/sites/{quote(chosen, safe='')}/searchAnalytics/query",
+            headers={**headers, "Content-Type": "application/json"},
+            json=body,
+            timeout=45,
+        )
+        if q_resp.status_code != 200:
+            return {
+                "ok": False,
+                "error": f"searchAnalytics HTTP {q_resp.status_code}",
+                "queries": [],
+                "siteUrl": chosen,
+            }
+        rows = q_resp.json().get("rows") or []
+        queries = []
+        for row in rows:
+            keys = row.get("keys") or []
+            query = keys[0] if keys else ""
+            pos = row.get("position")
+            queries.append(
+                {
+                    "query": query,
+                    "clicks": row.get("clicks", 0),
+                    "impressions": row.get("impressions", 0),
+                    "position": round(pos, 1) if pos is not None else None,
+                    "ctr": row.get("ctr"),
+                }
+            )
+        total_clicks = sum(q.get("clicks", 0) for q in queries)
+        total_impressions = sum(q.get("impressions", 0) for q in queries)
+        return {
+            "ok": True,
+            "error": None,
+            "siteUrl": chosen,
+            "queries": queries,
+            "total_clicks": total_clicks,
+            "total_impressions": total_impressions,
+            "period": f"{start.isoformat()} to {end.isoformat()}",
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200], "queries": []}
+
+
+def fetch_analytics() -> dict:
+    secret = ga_secret()
+    prop = analytics_property_id()
+    if not secret:
+        return {"ok": False, "error": "analytics_data_api not set"}
+    if not prop:
+        return {"ok": False, "error": "analytics_property_id not set"}
+    token, err = _access_token_for_secret(secret, [GA_SCOPE])
+    if not token:
+        return {"ok": False, "error": err or "auth failed"}
+    end = TODAY - timedelta(days=1)
+    start = end - timedelta(days=27)
+    body = {
+        "dateRanges": [{"startDate": start.isoformat(), "endDate": end.isoformat()}],
+        "metrics": [{"name": "sessions"}, {"name": "activeUsers"}, {"name": "screenPageViews"}],
+    }
+    try:
+        r = requests.post(
+            f"https://analyticsdata.googleapis.com/v1beta/{prop}:runReport",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=45,
+        )
+        if r.status_code != 200:
+            return {"ok": False, "error": f"runReport HTTP {r.status_code}"}
+        data = r.json()
+        values = []
+        if data.get("rows"):
+            values = data["rows"][0].get("metricValues") or []
+        sessions = int(values[0].get("value", "0")) if len(values) > 0 else 0
+        users = int(values[1].get("value", "0")) if len(values) > 1 else 0
+        pageviews = int(values[2].get("value", "0")) if len(values) > 2 else 0
+        return {
+            "ok": True,
+            "error": None,
+            "property": prop,
+            "sessions": sessions,
+            "active_users": users,
+            "pageviews": pageviews,
+            "period": f"{start.isoformat()} to {end.isoformat()}",
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
+
+
 def brand_mentioned(text: str, brand: str, host: str) -> bool:
     low = text.lower()
     return brand.lower() in low or host.lower() in low
@@ -794,8 +1022,20 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
             listings_score += 10
     listings_score = clamp_score(listings_score)
 
+    # Search Console + Google Analytics (Runtime Secrets: search_console_api, analytics_data_api)
+    gsc_data = fetch_search_console(final_url)
+    ga_data = fetch_analytics()
+
     # Component scores
     search_score = score_from_ratio(first_page_hits, len(queries))
+    if gsc_data.get("ok") and gsc_data.get("queries"):
+        gsc_on_page = sum(
+            1 for q in gsc_data["queries"][:10] if (q.get("position") or 99) <= 10
+        )
+        gsc_score = score_from_ratio(gsc_on_page, min(len(gsc_data["queries"]), 10))
+        search_score = max(search_score, gsc_score)
+        if search_method.startswith("Gemini"):
+            search_method = "Gemini sample + Search Console (28-day)"
     ai_score = score_from_ratio(gemini_mentions, len(ai_prompts))
 
     content_pts = 0
@@ -862,8 +1102,11 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
         gaps.append("AI answer engines name other firms on generic questions")
     if site_health_score < 60:
         gaps.append("mobile site speed needs work before traffic converts")
-    if not gsc_configured():
-        gaps.append("Search Console is not connected — ranks are Gemini search samples only")
+    if not gsc_data.get("ok"):
+        if gsc_configured():
+            gaps.append("Search Console is configured but returned no data for this property")
+        else:
+            gaps.append("Search Console is not connected — ranks are Gemini search samples only")
     if gaps:
         opportunity = "Clear opportunity. " + " ".join(g.capitalize() + "." for g in gaps[:2])
     elif overall >= 70:
@@ -932,9 +1175,41 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
             "label": f"First-page presence ({len(queries)}-query sample)",
             "value": f"{first_page_hits} of {len(queries)}",
             "status": metric_status("higher_is_better", first_page_hits, good=7, warn=3),
-            "note": f"Web-search sample via {search_method}. Not Search Console ranks.",
+            "note": (
+                f"Web-search sample via {search_method}."
+                if gsc_data.get("ok")
+                else f"Web-search sample via {search_method}. Not Search Console ranks."
+            ),
         }
     )
+    if gsc_data.get("ok"):
+        at_a_glance.append(
+            {
+                "label": "Search Console clicks (28 days)",
+                "value": str(gsc_data.get("total_clicks", 0)),
+                "status": metric_status(
+                    "higher_is_better", gsc_data.get("total_clicks", 0), good=50, warn=10
+                ),
+                "note": (
+                    f"{gsc_data.get('total_impressions', 0)} impressions · "
+                    f"{gsc_data.get('period', '')} · property {gsc_data.get('siteUrl', '')}"
+                ),
+            }
+        )
+    if ga_data.get("ok"):
+        at_a_glance.append(
+            {
+                "label": "Analytics sessions (28 days)",
+                "value": str(ga_data.get("sessions", 0)),
+                "status": metric_status(
+                    "higher_is_better", ga_data.get("sessions", 0), good=500, warn=100
+                ),
+                "note": (
+                    f"{ga_data.get('active_users', 0)} active users · "
+                    f"{ga_data.get('pageviews', 0)} pageviews · {ga_data.get('period', '')}"
+                ),
+            }
+        )
     at_a_glance.append(
         {
             "label": "Gemini mentions (sampled prompts)",
@@ -990,20 +1265,66 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
                     "detail": geocoded.get("formatted") or places.get("address") or "",
                 }
             )
-    if not gsc_configured():
+    if gsc_data.get("ok"):
+        other_facts.append(
+            {
+                "label": "Search Console",
+                "status": "On track",
+                "detail": (
+                    f"{gsc_data.get('total_clicks', 0)} clicks and "
+                    f"{gsc_data.get('total_impressions', 0)} impressions in the last 28 days."
+                ),
+            }
+        )
+    elif gsc_configured():
         other_facts.append(
             {
                 "label": "Search Console",
                 "status": "Watch",
-                "detail": "Not connected — connect for true Google position history.",
+                "detail": gsc_data.get("error") or "search_console_api set but no data returned.",
             }
         )
-    if not ga_configured():
+    else:
+        other_facts.append(
+            {
+                "label": "Search Console",
+                "status": "Watch",
+                "detail": "Not connected — add search_console_api Runtime Secret.",
+            }
+        )
+    if ga_data.get("ok"):
+        other_facts.append(
+            {
+                "label": "Google Analytics",
+                "status": "On track",
+                "detail": (
+                    f"{ga_data.get('sessions', 0)} sessions, "
+                    f"{ga_data.get('active_users', 0)} active users (28 days)."
+                ),
+            }
+        )
+    elif ga_configured():
         other_facts.append(
             {
                 "label": "Google Analytics",
                 "status": "Watch",
-                "detail": "Not connected — traffic trends unavailable in this snapshot.",
+                "detail": ga_data.get("error") or "analytics_data_api set but no data returned.",
+            }
+        )
+    elif ga_secret():
+        other_facts.append(
+            {
+                "label": "Google Analytics",
+                "status": "Watch",
+                "detail": "Set analytics_property_id (GA4 property ID) alongside analytics_data_api.",
+            }
+        )
+    else:
+        other_facts.append(
+            {
+                "label": "Google Analytics",
+                "status": "Watch",
+                "detail": "Not connected — add analytics_data_api and analytics_property_id.",
             }
         )
 
@@ -1158,13 +1479,18 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
         "meta_desc": meta_desc,
         "api_notes": {
             "gsc": gsc_configured(),
+            "gsc_ok": bool(gsc_data.get("ok")),
+            "gsc_error": (gsc_data.get("error") or "")[:120] if not gsc_data.get("ok") else "",
             "ga": ga_configured(),
+            "ga_ok": bool(ga_data.get("ok")),
+            "ga_error": (ga_data.get("error") or "")[:120] if not ga_data.get("ok") else "",
             "pagespeed": bool(google_key("PAGESPEED")),
             "gemini": bool(gemini_key()),
             "places": bool(google_key("PLACES")),
             "geocoding": bool(google_key("GEOCODING")),
             "search_method": search_method,
         },
+        "gsc_queries": gsc_data.get("queries") or [],
     }
 
 
