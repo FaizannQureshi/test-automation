@@ -47,17 +47,23 @@ def env(*keys: str) -> str:
     return ""
 
 
+# v1 Cloud env secret names (lowercase) + legacy uppercase aliases.
+_SERVICE_KEYS: dict[str, tuple[str, ...]] = {
+    "PAGESPEED": ("pagespeed_api", "GOOGLE_PAGESPEED_API_KEY", "GOOGLE_API_KEY"),
+    "PLACES": ("places_api", "GOOGLE_PLACES_API_KEY", "GOOGLE_API_KEY"),
+    "GEOCODING": ("geocoding_api", "GOOGLE_GEOCODING_API_KEY", "GOOGLE_API_KEY"),
+    "CUSTOM_SEARCH": ("custom_search_api", "GOOGLE_CUSTOM_SEARCH_API_KEY", "GOOGLE_API_KEY"),
+}
+
+
 def google_key(service: str = "") -> str:
-    """Resolve a Google API key; service-specific overrides shared key."""
     if service:
-        v = env(f"GOOGLE_{service.upper()}_API_KEY", "GOOGLE_API_KEY")
-        if v:
-            return v
+        return env(*_SERVICE_KEYS.get(service.upper(), ("GOOGLE_API_KEY",)))
     return env("GOOGLE_API_KEY")
 
 
 def gemini_key() -> str:
-    return env("GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY")
+    return env("gemini_api", "GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY")
 
 
 def cse_id() -> str:
@@ -397,7 +403,7 @@ def service_like_pages(headings: list[tuple[str, str]], page_urls: list[str], ho
 def pagespeed(url: str, *, strategy: str = "mobile") -> dict:
     key = google_key("PAGESPEED")
     if not key:
-        return {"ok": False, "error": "GOOGLE_API_KEY not set"}
+        return {"ok": False, "error": "pagespeed_api not set"}
     try:
         r = requests.get(
             "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
@@ -431,51 +437,59 @@ def pagespeed(url: str, *, strategy: str = "mobile") -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
 
 
-def custom_search_results(query: str, *, pages: int = 2) -> list[dict]:
-    """Up to 20 results (2 pages × 10) via Custom Search API."""
-    key = google_key("CUSTOM_SEARCH")
-    cx = cse_id()
-    if not key or not cx:
-        return []
-    results: list[dict] = []
-    for page in range(pages):
-        start = page * 10 + 1
-        try:
-            r = requests.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={"key": key, "cx": cx, "q": query, "num": 10, "start": start},
-                timeout=30,
-            )
-            if r.status_code != 200:
-                break
-            for item in r.json().get("items") or []:
-                link = item.get("link") or ""
-                results.append(
-                    {
-                        "title": item.get("title") or "",
-                        "link": link,
-                        "snippet": item.get("snippet") or "",
-                        "position": len(results) + 1,
-                    }
-                )
-        except Exception:
-            break
-    return results
+def parse_search_verdict(text: str, host: str) -> tuple[bool, int | None, list[str]]:
+    """Parse Gemini search-grounding reply for presence, position, competitor hosts."""
+    host_clean = site_host(host)
+    low = text.lower()
+    found = host_clean in low or host.lower() in low
+    pos: int | None = None
+    m = re.search(r"POSITION[=:\s]+(\d+)", text, re.I)
+    if m:
+        pos = int(m.group(1))
+    elif re.search(r"POSITION[=:\s]+none", text, re.I):
+        pos = None
+    elif found:
+        for line in text.splitlines():
+            if host_clean in line.lower():
+                pm = re.search(r"\b(\d{1,2})\b", line)
+                if pm:
+                    pos = int(pm.group(1))
+                    break
+    competitors: list[str] = []
+    for dom in re.findall(r"(?:https?://)?(?:www\.)?([a-z0-9][a-z0-9.-]+\.[a-z]{2,})", low):
+        d = dom.removeprefix("www.")
+        if d != host_clean and d not in competitors and not d.endswith("." + host_clean):
+            competitors.append(d)
+    return found, pos, competitors[:5]
 
 
-def host_in_results(host: str, results: list[dict]) -> tuple[bool, int | None]:
-    host = host.lower().removeprefix("www.")
-    for item in results:
-        link_host = site_host(item.get("link") or "")
-        if host in link_host or link_host.endswith("." + host):
-            return True, item.get("position")
-    return False, None
+def gemini_search_ranking(query: str, brand: str, host: str) -> dict:
+    """Sample Google search visibility via Gemini + Google Search grounding."""
+    prompt = (
+        f'Search Google for: "{query}"\n\n'
+        f"Does {host} (business: {brand}) appear in the first 20 organic results?\n"
+        "Reply with exactly these lines first:\n"
+        "FOUND=yes or FOUND=no\n"
+        "POSITION=<number 1-20 or none>\n"
+        "Then briefly note up to 5 other domains that ranked instead."
+    )
+    resp = gemini_ask(prompt, use_search=True)
+    text = resp.get("text") or ""
+    found, pos, competitors = parse_search_verdict(text, host)
+    return {
+        "ok": resp.get("ok", False),
+        "text": text,
+        "found": found,
+        "position": pos,
+        "competitors": competitors,
+        "grounding_urls": resp.get("grounding_urls") or [],
+    }
 
 
 def places_lookup(business_name: str, website: str) -> dict:
     key = google_key("PLACES")
     if not key:
-        return {"ok": False, "error": "GOOGLE_API_KEY not set"}
+        return {"ok": False, "error": "places_api not set"}
     host = site_host(website)
     query = business_name or host
     try:
@@ -540,32 +554,32 @@ def geocode_address(address: str) -> dict:
         return {"ok": False}
 
 
-def gemini_ask(prompt: str) -> dict:
+def gemini_ask(prompt: str, *, use_search: bool = False) -> dict:
     key = gemini_key()
     if not key:
-        return {"ok": False, "error": "GEMINI_API_KEY not set", "text": ""}
+        return {"ok": False, "error": "gemini_api not set", "text": "", "grounding_urls": []}
     model = env("GEMINI_MODEL") or "gemini-2.0-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body: dict[str, Any] = {"contents": [{"parts": [{"text": prompt}]}]}
+    if use_search:
+        body["tools"] = [{"google_search": {}}]
     try:
-        r = requests.post(
-            url,
-            params={"key": key},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=60,
-        )
+        r = requests.post(url, params={"key": key}, json=body, timeout=90)
         data = r.json()
         if r.status_code != 200:
             err = data.get("error", {}).get("message", r.text[:200])
-            return {"ok": False, "error": err, "text": ""}
-        parts = (
-            data.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])
-        )
+            return {"ok": False, "error": err, "text": "", "grounding_urls": []}
+        candidate = data.get("candidates", [{}])[0]
+        parts = candidate.get("content", {}).get("parts", [{}])
         text = parts[0].get("text", "") if parts else ""
-        return {"ok": True, "text": text, "error": None}
+        grounding_urls: list[str] = []
+        for chunk in (candidate.get("groundingMetadata") or {}).get("groundingChunks") or []:
+            uri = (chunk.get("web") or {}).get("uri")
+            if uri:
+                grounding_urls.append(uri)
+        return {"ok": True, "text": text, "error": None, "grounding_urls": grounding_urls}
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200], "text": ""}
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200], "text": "", "grounding_urls": []}
 
 
 def brand_mentioned(text: str, brand: str, host: str) -> bool:
@@ -697,14 +711,24 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
     for u in extra_ps_urls:
         ps_extra.append({"url": u, **pagespeed(u, strategy="mobile")})
 
-    # Search sample
+    # Search sample via Gemini + Google Search grounding
     queries = build_search_queries(brand, host, parser.headings)
     search_obs: list[dict] = []
     competitors: dict[str, str] = {}
     first_page_hits = 0
+    search_method = "Gemini + Google Search grounding"
+    if not gemini_key():
+        search_method = "Unavailable (gemini_api not set)"
     for q in queries:
-        results = custom_search_results(q, pages=2)
-        found, pos = host_in_results(host, results)
+        if gemini_key():
+            sample = gemini_search_ranking(q, brand, host)
+            found = sample["found"]
+            pos = sample["position"]
+            time.sleep(1)  # gentle rate limit between grounded searches
+        else:
+            sample = {"found": False, "position": None, "competitors": []}
+            found = False
+            pos = None
         if found and pos and pos <= 10:
             first_page_hits += 1
         score = 0
@@ -715,39 +739,40 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
                 score = clamp_score(70 - (pos - 4) * 5)
             elif pos <= 20:
                 score = clamp_score(30 - (pos - 11) * 2)
-        note = "Measured: site host was not in the web-search sample links."
+        note = "Measured: site host was not in the web-search sample."
         if found and pos:
-            if pos <= 10:
-                note = f"About position {pos}"
-            else:
-                note = f"Found on page 2 (position {pos})"
-        else:
-            for item in results[:5]:
-                ch = site_host(item.get("link") or "")
-                if ch and ch != host:
-                    competitors[ch] = item.get("link") or f"https://{ch}"
+            note = f"About position {pos}" if pos <= 10 else f"Found on page 2 (position {pos})"
+        elif not gemini_key():
+            note = "Search sample skipped — gemini_api not configured."
+        for ch in sample.get("competitors") or []:
+            competitors[ch] = f"https://{ch}"
         search_obs.append({"query": q, "score": score, "position": pos, "found": found, "note": note})
 
-    # Gemini AI sample
+    # Gemini AI answer sample (buyer prompts)
     ai_prompts = build_ai_prompts(brand, host, queries)
     gemini_mentions = 0
     gemini_citations = 0
     ai_competitors: list[str] = []
-    for prompt in ai_prompts:
-        resp = gemini_ask(prompt)
+    for i, prompt in enumerate(ai_prompts):
+        use_search = i >= 2  # category prompts use grounding
+        resp = gemini_ask(prompt, use_search=use_search)
         text = resp.get("text") or ""
         if brand_mentioned(text, brand, host):
             gemini_mentions += 1
-        if owned_citations(text, host):
+        if owned_citations(text, host) or any(
+            site_host(u) == host for u in resp.get("grounding_urls") or []
+        ):
             gemini_citations += 1
         if not brand_mentioned(text, brand, host):
             for word in re.findall(r"\b[A-Z][a-zA-Z+&\s]{2,40}\b", text):
                 w = word.strip()
                 if w.lower() not in brand.lower() and len(w) > 3:
                     ai_competitors.append(w)
+        time.sleep(0.5)
 
-    # Places / listings
+    # Places / listings (+ optional geocode check)
     places = places_lookup(brand, final_url)
+    geocoded = geocode_address(places.get("address", "")) if places.get("ok") else {"ok": False}
     listings_score = 0
     if places.get("ok"):
         listings_score = 50
@@ -828,7 +853,7 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
     if site_health_score < 60:
         gaps.append("mobile site speed needs work before traffic converts")
     if not gsc_configured():
-        gaps.append("Search Console is not connected — ranks are sample-based only")
+        gaps.append("Search Console is not connected — ranks are Gemini search samples only")
     if gaps:
         opportunity = "Clear opportunity. " + " ".join(g.capitalize() + "." for g in gaps[:2])
     elif overall >= 70:
@@ -897,7 +922,7 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
             "label": f"First-page presence ({len(queries)}-query sample)",
             "value": f"{first_page_hits} of {len(queries)}",
             "status": metric_status("higher_is_better", first_page_hits, good=7, warn=3),
-            "note": "Web-search sample via Custom Search API (pages 1–2). Not Search Console ranks.",
+            "note": f"Web-search sample via {search_method}. Not Search Console ranks.",
         }
     )
     at_a_glance.append(
@@ -905,7 +930,15 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
             "label": "Gemini mentions (sampled prompts)",
             "value": f"{gemini_mentions} of {len(ai_prompts)}",
             "status": metric_status("higher_is_better", gemini_mentions, good=7, warn=3),
-            "note": "Branded vs category prompts via Gemini.",
+            "note": "Branded vs category buyer prompts via Gemini (category prompts use Google Search grounding).",
+        }
+    )
+    at_a_glance.append(
+        {
+            "label": "Gemini citations (sampled prompts)",
+            "value": f"{gemini_citations} of {len(ai_prompts)}",
+            "status": metric_status("higher_is_better", gemini_citations, good=7, warn=3),
+            "note": "Owned URLs appeared as Gemini grounding sources.",
         }
     )
 
@@ -939,6 +972,14 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
                 ),
             }
         )
+        if geocoded.get("ok"):
+            other_facts.append(
+                {
+                    "label": "Listing address (Geocoding)",
+                    "status": "On track",
+                    "detail": geocoded.get("formatted") or places.get("address") or "",
+                }
+            )
     if not gsc_configured():
         other_facts.append(
             {
@@ -1109,9 +1150,10 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
             "gsc": gsc_configured(),
             "ga": ga_configured(),
             "pagespeed": bool(google_key("PAGESPEED")),
-            "cse": bool(google_key("CUSTOM_SEARCH") and cse_id()),
-            "places": bool(google_key("PLACES")),
             "gemini": bool(gemini_key()),
+            "places": bool(google_key("PLACES")),
+            "geocoding": bool(google_key("GEOCODING")),
+            "search_method": search_method,
         },
     }
 
@@ -1247,7 +1289,7 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
 
     return f"""<div style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0F172A;background:#F1F5F9;line-height:1.5;">
 <header style="background:linear-gradient(135deg,#0F172A 0%,#1E3A5F 100%);color:#FFFFFF;padding:32px 28px 28px;">
-<p style="margin:0 0 6px;font-size:12px;letter-spacing:0.1em;text-transform:uppercase;color:#93C5FD;">Connection Inc · Visibility report</p>
+<p style="margin:0 0 6px;font-size:12px;letter-spacing:0.1em;text-transform:uppercase;color:#93C5FD;">Private AI and search snapshot · Connection Inc</p>
 <h1 style="margin:0 0 10px;font-size:28px;line-height:1.2;color:#FFFFFF;">How visible is {esc(brand)}?</h1>
 <p style="margin:0 0 16px;font-size:15px;color:#CBD5E1;max-width:720px;line-height:1.55;">{esc(audit.get('opportunity'))}</p>
 <p style="margin:0;font-size:13px;color:#94A3B8;">Prepared on {esc(prepared)} · Website <a href="{esc(site)}" style="color:#93C5FD;">{esc(host)}</a></p>
@@ -1317,7 +1359,7 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
 {steps}
 </section>
 <footer style="padding:16px 28px 28px;border-top:1px solid #E2E8F0;background:#FFFFFF;">
-<p style="margin:0;font-size:12px;color:#64748B;line-height:1.5;">Private AI and search snapshot for {esc(client_name)}. Generated {esc(REPORT_DATE)} by Connection Inc weekly automation. Search ranks are Custom Search samples (pages 1–2), not guaranteed Google positions. Connect Search Console and Analytics for historical data.</p>
+<p style="margin:0;font-size:12px;color:#64748B;line-height:1.5;">Private AI and search snapshot for {esc(client_name)}. Generated {esc(REPORT_DATE)} by Connection Inc weekly automation. Search observations use Gemini with Google Search grounding — sample-based, not guaranteed Google positions. Connect Search Console and Analytics for historical data.</p>
 </footer>
 </div>"""
 

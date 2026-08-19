@@ -1,59 +1,70 @@
 # test-automation
 
-Weekly Connection Inc client visibility reports via `weekly_seo_report.py`.
+Weekly Connection Inc client **visibility reports** via `weekly_seo_report.py` (Oasbit-style template).
 
-## Run (Cloud Agent / automation)
+## Architecture (hybrid)
+
+| Layer | Responsibility |
+|---|---|
+| **Cursor Automation** | Install deps, run `python3 weekly_seo_report.py`, return JSON summary |
+| **`weekly_seo_report.py`** | API calls, scoring, HTML template, portal POST + assignment |
+| **Runtime Secrets (v1)** | API keys injected as env vars — never logged |
+
+The agent is a **runner only**. Report logic stays in the committed Python script.
+
+## Run
 
 ```bash
 pip install -r requirements.txt
 python3 weekly_seo_report.py
 ```
 
-Requires `PORTAL_API_KEY` (Runtime Secret). Never log or print secret values.
+Automation prompt: see [AUTOMATION_PROMPT.md](./AUTOMATION_PROMPT.md).
 
-## Runtime secrets — name your API keys exactly like this
+## v1 Runtime Secrets (your naming)
 
-| Secret name | Used for | Required now? |
-|---|---|---|
-| `PORTAL_API_KEY` | Connection Inc portal API auth | **Yes** |
-| `GOOGLE_API_KEY` | Shared fallback for Google APIs below | **Yes** (or use per-service keys) |
-| `GOOGLE_CSE_ID` | Custom Search Engine ID (`cx`) | **Yes** (search ranking sample) |
-| `GEMINI_API_KEY` | Gemini AI answer sampling | **Yes** |
-| `GOOGLE_PAGESPEED_API_KEY` | PageSpeed Insights (optional override) | Optional — falls back to `GOOGLE_API_KEY` |
-| `GOOGLE_CUSTOM_SEARCH_API_KEY` | Custom Search (optional override) | Optional — falls back to `GOOGLE_API_KEY` |
-| `GOOGLE_PLACES_API_KEY` | Places API (New) for GBP/listings | Optional — falls back to `GOOGLE_API_KEY` |
-| `GOOGLE_GEOCODING_API_KEY` | Geocoding API | Optional — falls back to `GOOGLE_API_KEY` |
-| `GOOGLE_SEARCH_CONSOLE_CREDENTIALS_JSON` | Search Console (service account JSON) | **Not yet** — script notes when missing |
-| `GOOGLE_ANALYTICS_PROPERTY_ID` | GA4 property ID | **Not yet** — script notes when missing |
-| `GOOGLE_ANALYTICS_CREDENTIALS_JSON` | GA4 service account JSON | **Not yet** |
+| Secret name | Used for |
+|---|---|
+| `PORTAL_API_KEY` | Connection Inc portal API (Personal secret) |
+| `pagespeed_api` | PageSpeed Insights |
+| `gemini_api` | Gemini AI + Google Search grounding for ranking samples |
+| `places_api` | Places API (New) — Google Business Profile |
+| `geocoding_api` | Geocoding — verify listing address |
+| `custom_search_api` | Reserved (Google no longer allows full-web CSE for new engines) |
+| `maps_javascript_api` | Not used by this script (browser-only) |
 
-`Maps JavaScript API` is a browser-only key — not used by this Python job.
+Legacy uppercase names (`GEMINI_API_KEY`, `GOOGLE_PAGESPEED_API_KEY`, etc.) also work as fallbacks.
 
 Optional: `GEMINI_MODEL` (default `gemini-2.0-flash`).
 
-## Google Cloud APIs to enable
+Later (not wired yet): `GOOGLE_SEARCH_CONSOLE_CREDENTIALS_JSON`, `GOOGLE_ANALYTICS_PROPERTY_ID`.
 
-- Custom Search API
-- PageSpeed Insights API
-- Places API (New)
-- Geocoding API
-- Generative Language API (Gemini)
+## Data sources in each report
 
-Later: Search Console API, Google Analytics Data API.
+| Section | Source |
+|---|---|
+| Scores (Search, Listings, AI, Site health, Content, Structure) | Computed from API + crawl data |
+| Facts / At a glance | PageSpeed, sitemap crawl, Gemini samples |
+| Offers | Homepage headings |
+| Search | Gemini + Google Search grounding (10-query sample) |
+| Improve / Compare / Next | Derived findings + competitor domains from samples |
 
-## Custom Search setup
-
-1. Create a Programmable Search Engine at [programmablesearchengine.google.com](https://programmablesearchengine.google.com/) (search the entire web).
-2. Copy the **Search engine ID** into `GOOGLE_CSE_ID`.
-
-Ranking logic: for each of 10 queries, the script checks whether the client domain appears in the **first 2 pages** (20 results) of Custom Search results and assigns a score.
+Search Console and Analytics show as “not connected” until those credentials are added.
 
 ## Pilot clients
 
-Only clients listed in `PILOTS` inside `weekly_seo_report.py` are processed. Expand that list after verifying the template in Admin → Reports.
+Only clients in `PILOTS` inside `weekly_seo_report.py` are processed:
 
-## Report template
+```python
+PILOTS = [
+    ("Adam Zeman", "cmkoitqae0001ib04j8hrefa9"),
+]
+```
 
-Reports follow the Oasbit visibility layout: Scores, Facts, Offers, Search, Improve, Compare, Next — published as `RICH_TEXT` to the client portal.
+Expand after verifying the template in Admin → Reports.
 
-Reference: [Oasbit visibility report sample](https://oasbit.com/114/4757a659-1a96-4425-947d-4ffae49f87c2)
+## Report template reference
+
+[Oasbit visibility report sample](https://oasbit.com/114/4757a659-1a96-4425-947d-4ffae49f87c2)
+
+Sections: Scores · Facts · Offers · Search · Improve · Compare · Next
