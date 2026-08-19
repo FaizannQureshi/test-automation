@@ -28,7 +28,16 @@ Automation prompt: [AUTOMATION_PROMPT.md](./AUTOMATION_PROMPT.md)
 
 Optional: `GEMINI_MODEL` (default `gemini-3.6-flash`).
 
-### Search Console + Analytics credentials
+### Per-client overrides (portal custom fields)
+
+When the global `analytics_property_id` env secret is for a different site, set these on the **client record**:
+
+| Custom field name | Example | Purpose |
+|---|---|---|
+| `GA4 Property ID` | `365023674` | Client’s GA4 property (must match the site you audit) |
+| `Search Console Site URL` | `sc-domain:adamzmortgage.com` or `https://www.adamzmortgage.com/` | Exact GSC property URL |
+
+Global env secrets are the fallback when client fields are empty.
 
 Unlike PageSpeed, **Search Console and GA4 Data APIs require OAuth**, not a plain API key in the URL.
 

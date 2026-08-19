@@ -173,6 +173,60 @@ def website_url_from_client(client: dict) -> str | None:
     return None
 
 
+def custom_field_value(client: dict, *names: str) -> str | None:
+    """Find a custom field value by case-insensitive name (any category)."""
+    wanted = {n.strip().lower() for n in names}
+    for field in client.get("customFields") or []:
+        name = (field.get("name") or "").strip().lower()
+        if name in wanted:
+            val = (field.get("value") or "").strip()
+            if val:
+                return val
+    return None
+
+
+def ga_property_from_client(client: dict) -> str:
+    raw = custom_field_value(
+        client,
+        "GA4 Property ID",
+        "Analytics Property ID",
+        "Google Analytics Property ID",
+        "analytics property id",
+        "ga4 property id",
+    )
+    if not raw:
+        return analytics_property_id()
+    raw = raw.strip()
+    if raw.isdigit():
+        return f"properties/{raw}"
+    if not raw.startswith("properties/"):
+        return f"properties/{raw}"
+    return raw
+
+
+def gsc_site_from_client(client: dict) -> str | None:
+    return custom_field_value(
+        client,
+        "Search Console Site URL",
+        "Search Console Property",
+        "GSC Site URL",
+        "search console site url",
+        "gsc property",
+    )
+
+
+def normalize_gsc_site(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("sc-domain:"):
+        return raw
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw if raw.endswith("/") else raw + "/"
+    if "." in raw and not raw.startswith("sc-domain:"):
+        host = raw.removeprefix("www.")
+        return f"sc-domain:{host}"
+    return raw
+
+
 def normalize_site_url(raw: str) -> str:
     raw = raw.strip()
     if not re.match(r"^https?://", raw, re.I):
@@ -682,7 +736,7 @@ def gsc_site_url_candidates(site_url: str) -> list[str]:
     return out
 
 
-def fetch_search_console(site_url: str) -> dict:
+def fetch_search_console(site_url: str, *, gsc_override: str | None = None) -> dict:
     secret = gsc_secret()
     if not secret:
         return {"ok": False, "error": "search_console_api not set", "queries": []}
@@ -705,10 +759,21 @@ def fetch_search_console(site_url: str) -> dict:
         site_entries = sites_resp.json().get("siteEntry") or []
         permitted = {e.get("siteUrl") for e in site_entries if e.get("siteUrl")}
         chosen = None
-        for candidate in gsc_site_url_candidates(site_url):
-            if candidate in permitted:
-                chosen = candidate
-                break
+        if gsc_override:
+            override = normalize_gsc_site(gsc_override)
+            if override in permitted:
+                chosen = override
+            else:
+                host = site_host(override.replace("sc-domain:", "https://" + override.split(":", 1)[-1]))
+                for p in permitted:
+                    if host in p or override in p:
+                        chosen = p
+                        break
+        if not chosen:
+            for candidate in gsc_site_url_candidates(site_url):
+                if candidate in permitted:
+                    chosen = candidate
+                    break
         if not chosen and permitted:
             host = site_host(site_url)
             for p in permitted:
@@ -716,10 +781,18 @@ def fetch_search_console(site_url: str) -> dict:
                     chosen = p
                     break
         if not chosen:
+            available = ", ".join(sorted(permitted)[:6]) if permitted else "none"
             return {
                 "ok": False,
-                "error": "No matching Search Console property for this site URL",
+                "error": (
+                    f"No matching Search Console property for {site_url}. "
+                    f"Properties this service account can access: {available}. "
+                    "Add the service account email in Search Console → Settings → Users, "
+                    "or set a client custom field Search Console Site URL to the exact property "
+                    "(e.g. sc-domain:example.com or https://www.example.com/)."
+                ),
                 "queries": [],
+                "available_properties": sorted(permitted),
             }
         end = TODAY - timedelta(days=1)
         start = end - timedelta(days=27)
@@ -772,13 +845,13 @@ def fetch_search_console(site_url: str) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200], "queries": []}
 
 
-def fetch_analytics() -> dict:
+def fetch_analytics(property_id: str | None = None) -> dict:
     secret = ga_secret()
-    prop = analytics_property_id()
+    prop = (property_id or "").strip() or analytics_property_id()
     if not secret:
         return {"ok": False, "error": "analytics_data_api not set"}
     if not prop:
-        return {"ok": False, "error": "analytics_property_id not set"}
+        return {"ok": False, "error": "analytics_property_id not set (env or client GA4 Property ID custom field)"}
     token, err = _access_token_for_secret(secret, [GA_SCOPE])
     if not token:
         return {"ok": False, "error": err or "auth failed"}
@@ -799,7 +872,13 @@ def fetch_analytics() -> dict:
             timeout=45,
         )
         if r.status_code != 200:
-            return {"ok": False, "error": f"runReport HTTP {r.status_code}"}
+            hint = ""
+            if r.status_code == 403:
+                hint = (
+                    " — grant the service account email Viewer access on this GA4 property "
+                    "(Admin → Property access management) and enable Google Analytics Data API in GCP."
+                )
+            return {"ok": False, "error": f"runReport HTTP {r.status_code}{hint}", "property": prop}
         data = r.json()
         values = []
         if data.get("rows"):
@@ -899,7 +978,13 @@ def score_from_ratio(found: int, total: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def audit_visibility(site_url: str, business_name: str) -> dict:
+def audit_visibility(
+    site_url: str,
+    business_name: str,
+    *,
+    ga_property: str | None = None,
+    gsc_site: str | None = None,
+) -> dict:
     s = session()
     host = site_host(site_url)
     brand = business_name.strip() or host.split(".")[0].replace("-", " ").title()
@@ -1023,8 +1108,8 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
     listings_score = clamp_score(listings_score)
 
     # Search Console + Google Analytics (Runtime Secrets: search_console_api, analytics_data_api)
-    gsc_data = fetch_search_console(final_url)
-    ga_data = fetch_analytics()
+    gsc_data = fetch_search_console(final_url, gsc_override=gsc_site)
+    ga_data = fetch_analytics(ga_property)
 
     # Component scores
     search_score = score_from_ratio(first_page_hits, len(queries))
@@ -2051,8 +2136,20 @@ def main() -> int:
             continue
         site = normalize_site_url(site)
         business = client.get("businessName") or name
-        print(json.dumps({"event": "audit_start", "client": name, "site": site}))
-        audit = audit_visibility(site, business)
+        ga_prop = ga_property_from_client(client)
+        gsc_site = gsc_site_from_client(client)
+        print(
+            json.dumps(
+                {
+                    "event": "audit_start",
+                    "client": name,
+                    "site": site,
+                    "gaPropertyConfigured": bool(ga_prop),
+                    "gscSiteOverride": bool(gsc_site),
+                }
+            )
+        )
+        audit = audit_visibility(site, business, ga_property=ga_prop, gsc_site=gsc_site)
         print(
             json.dumps(
                 {
