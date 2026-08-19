@@ -1,0 +1,2 @@
+# Runtime dependency for weekly_seo_report.py
+requests>=2.32,<3
