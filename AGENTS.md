@@ -1,18 +1,70 @@
 # test-automation
 
-## Cursor Cloud specific instructions
+Weekly Connection Inc client **visibility reports** via `weekly_seo_report.py` (Oasbit-style template).
 
-This repository is currently a **stub**: the only tracked file is `README.md`. There is no
-application code, package manifest (`package.json`, `pyproject.toml`, etc.), lockfile,
-`Makefile`, `docker-compose`, `.devcontainer`, or `.cursor/environment.json`.
+## Architecture (hybrid)
 
-As a result there is nothing to install, lint, build, run, or test yet, and no services to
-start. The Cloud Agent environment therefore uses a no-op update script.
+| Layer | Responsibility |
+|---|---|
+| **Cursor Automation** | Install deps, run `python3 weekly_seo_report.py`, return JSON summary |
+| **`weekly_seo_report.py`** | API calls, scoring, HTML template, portal POST + assignment |
+| **Runtime Secrets (v1)** | API keys injected as env vars — never logged |
 
-Baseline toolchain available on the VM (for reference, not pinned by the repo): Node.js 22,
-npm 10, Python 3.12, git 2.43.
+The agent is a **runner only**. Report logic stays in the committed Python script.
 
-When real code is added to this repository (e.g. an app plus its `package.json`/lockfile,
-Dockerfile, or `docker-compose.yml`), re-run environment setup so the update script installs
-the new dependencies and this section is updated with the actual lint/test/build/run commands
-and services.
+## Run
+
+```bash
+pip install -r requirements.txt
+python3 weekly_seo_report.py
+```
+
+Automation prompt: see [AUTOMATION_PROMPT.md](./AUTOMATION_PROMPT.md).
+
+## v1 Runtime Secrets (your naming)
+
+| Secret name | Used for |
+|---|---|
+| `PORTAL_API_KEY` | Connection Inc portal API (Personal secret) |
+| `pagespeed_api` | PageSpeed Insights |
+| `gemini_api` | Gemini AI + Google Search grounding for ranking samples |
+| `places_api` | Places API (New) — Google Business Profile |
+| `geocoding_api` | Geocoding — verify listing address |
+| `custom_search_api` | Reserved (Google no longer allows full-web CSE for new engines) |
+| `maps_javascript_api` | Not used by this script (browser-only) |
+
+Legacy uppercase names (`GEMINI_API_KEY`, `GOOGLE_PAGESPEED_API_KEY`, etc.) also work as fallbacks.
+
+Optional: `GEMINI_MODEL` (default `gemini-2.0-flash`).
+
+Later (not wired yet): `GOOGLE_SEARCH_CONSOLE_CREDENTIALS_JSON`, `GOOGLE_ANALYTICS_PROPERTY_ID`.
+
+## Data sources in each report
+
+| Section | Source |
+|---|---|
+| Scores (Search, Listings, AI, Site health, Content, Structure) | Computed from API + crawl data |
+| Facts / At a glance | PageSpeed, sitemap crawl, Gemini samples |
+| Offers | Homepage headings |
+| Search | Gemini + Google Search grounding (10-query sample) |
+| Improve / Compare / Next | Derived findings + competitor domains from samples |
+
+Search Console and Analytics show as “not connected” until those credentials are added.
+
+## Pilot clients
+
+Only clients in `PILOTS` inside `weekly_seo_report.py` are processed:
+
+```python
+PILOTS = [
+    ("Adam Zeman", "cmkoitqae0001ib04j8hrefa9"),
+]
+```
+
+Expand after verifying the template in Admin → Reports.
+
+## Report template reference
+
+[Oasbit visibility report sample](https://oasbit.com/114/4757a659-1a96-4425-947d-4ffae49f87c2)
+
+Sections: Scores · Facts · Offers · Search · Improve · Compare · Next
