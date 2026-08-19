@@ -568,7 +568,7 @@ def gemini_ask(prompt: str, *, use_search: bool = False) -> dict:
     key = gemini_key()
     if not key:
         return {"ok": False, "error": "gemini_api not set", "text": "", "grounding_urls": []}
-    model = env("GEMINI_MODEL") or "gemini-2.0-flash"
+    model = env("GEMINI_MODEL") or "gemini-3.6-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body: dict[str, Any] = {"contents": [{"parts": [{"text": prompt}]}]}
     if use_search:

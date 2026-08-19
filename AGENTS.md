@@ -35,7 +35,7 @@ Automation prompt: see [AUTOMATION_PROMPT.md](./AUTOMATION_PROMPT.md).
 
 Legacy uppercase names (`GEMINI_API_KEY`, `GOOGLE_PAGESPEED_API_KEY`, etc.) also work as fallbacks.
 
-Optional: `GEMINI_MODEL` (default `gemini-2.0-flash`).
+Optional: `GEMINI_MODEL` (default `gemini-3.6-flash`).
 
 Later (not wired yet): `GOOGLE_SEARCH_CONSOLE_CREDENTIALS_JSON`, `GOOGLE_ANALYTICS_PROPERTY_ID`.
 
