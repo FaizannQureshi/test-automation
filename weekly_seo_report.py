@@ -474,22 +474,252 @@ def schema_types(json_ld_blocks: list[str]) -> set[str]:
     return types
 
 
-def service_like_pages(headings: list[tuple[str, str]], page_urls: list[str], host: str) -> list[str]:
-    keywords = ("service", "product", "solution", "offer", "about")
+def schema_offer_names(json_ld_blocks: list[str]) -> list[dict]:
+    """Extract Service / Product / Offer names from JSON-LD."""
+    offer_types = {
+        "service",
+        "product",
+        "offer",
+        "financialproduct",
+        "loanorcredit",
+        "professionalservice",
+    }
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            for x in node:
+                walk(x)
+            return
+        if not isinstance(node, dict):
+            return
+        types = node.get("@type")
+        type_list = [types] if isinstance(types, str) else (types if isinstance(types, list) else [])
+        type_norm = {str(t).lower() for t in type_list}
+        if type_norm & offer_types:
+            name = (node.get("name") or node.get("serviceType") or "").strip()
+            if name and name.lower() not in seen and looks_like_offer_name(name):
+                seen.add(name.lower())
+                kind = "Product" if "product" in type_norm else "Service"
+                found.append({"name": name, "kind": kind, "score": None, "source": "schema"})
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                walk(v)
+
+    for blob in json_ld_blocks:
+        try:
+            walk(json.loads(blob))
+        except json.JSONDecodeError:
+            continue
+    return found
+
+
+# Marketing / nav headings that are not sellable services
+_OFFER_NOISE = re.compile(
+    r"(?i)^("
+    r"home|about|about us|contact|contact us|blog|news|faq|faqs|privacy|terms|"
+    r"get started|learn more|read more|click here|welcome|our team|meet the team|"
+    r"testimonials|reviews|resources|menu|navigation|footer|header|"
+    r"let'?s talk.*|reach .*|serving .*|talk through.*|schedule .*|"
+    r"book .*|call us|get in touch|why (choose|us|work)|how it works|"
+    r"what (we|clients) say|ready to|start here|next steps?"
+    r")$"
+)
+
+_SERVICE_PATH_HINTS = (
+    "service",
+    "services",
+    "product",
+    "products",
+    "solution",
+    "solutions",
+    "offer",
+    "offers",
+    "mortgage",
+    "loan",
+    "loans",
+    "refinance",
+    "refinancing",
+    "purchase",
+    "pre-approval",
+    "preapproval",
+    "heloc",
+    "fha",
+    "va-",
+    "/va/",
+    "conventional",
+    "jumbo",
+    "first-time",
+    "first_time",
+    "investment",
+    "commercial",
+)
+
+
+def looks_like_offer_name(text: str) -> bool:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if len(t) < 3 or len(t) > 90:
+        return False
+    if _OFFER_NOISE.match(t):
+        return False
+    # Skip pure CTAs / questions that aren't product names
+    if t.endswith("?") and not any(k in t.lower() for k in ("loan", "mortgage", "refinance")):
+        return False
+    words = t.split()
+    if len(words) > 12:
+        return False
+    return True
+
+
+def title_from_url_slug(url: str) -> str:
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return ""
+    slug = path.split("/")[-1]
+    slug = re.sub(r"\.(html?|php)$", "", slug, flags=re.I)
+    slug = slug.replace("-", " ").replace("_", " ").strip()
+    return " ".join(w.capitalize() if w.islower() else w for w in slug.split())
+
+
+def offers_from_portal_client(client: dict | None) -> list[dict]:
+    if not client:
+        return []
+    raw = custom_field_value(
+        client,
+        "Services",
+        "Service List",
+        "Offers",
+        "Products",
+        "Keywords",
+        "Target Keywords",
+        "Service Keywords",
+    )
+    if not raw:
+        return []
+    parts = re.split(r"[\n,;|/]+", raw)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for part in parts:
+        name = re.sub(r"\s+", " ", part).strip(" -•*")
+        if not looks_like_offer_name(name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "kind": "Service", "score": None, "source": "portal"})
+    return out[:12]
+
+
+def offers_from_sitemap(page_urls: list[str], host: str) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for url in page_urls:
+        if site_host(url) != host:
+            continue
+        low = url.lower()
+        path = urlparse(url).path.lower()
+        if path in ("", "/"):
+            continue
+        if not any(h in low for h in _SERVICE_PATH_HINTS):
+            continue
+        name = title_from_url_slug(url)
+        if not looks_like_offer_name(name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "kind": "Service", "score": None, "source": "sitemap", "url": url})
+    return out[:12]
+
+
+def offers_from_gemini(brand: str, host: str, homepage_html: str) -> list[dict]:
+    if not gemini_key() or not homepage_html:
+        return []
+    # Keep prompt small — strip tags to text-ish snippet
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", homepage_html)
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()[:3500]
+    prompt = (
+        f"Business: {brand} ({host}).\n"
+        "From this homepage text, list ONLY sellable services or products a customer would buy "
+        "(e.g. mortgage refinancing, FHA loans). "
+        "Do NOT list marketing slogans, CTAs, locations, team bios, or nav labels.\n"
+        "Reply with one service per line, plain text, max 10 lines. No numbering.\n\n"
+        f"Homepage text:\n{text}"
+    )
+    resp = gemini_ask(prompt, use_search=False)
+    raw = resp.get("text") or ""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        name = re.sub(r"^[\d\.\-\*\•]+\s*", "", line).strip()
+        name = name.strip("\"'`")
+        if not looks_like_offer_name(name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "kind": "Service", "score": None, "source": "gemini"})
+    return out[:10]
+
+
+def discover_offers(
+    *,
+    client: dict | None,
+    brand: str,
+    host: str,
+    json_ld: list[str],
+    page_urls: list[str],
+    homepage_html: str,
+) -> list[dict]:
+    """Resolve real services/products — never treat marketing H2/H3 as offers."""
+    portal = offers_from_portal_client(client)
+    if portal:
+        return portal[:12]
+
+    schema = schema_offer_names(json_ld)
+    sitemap = offers_from_sitemap(page_urls, host)
+
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for group in (schema, sitemap):
+        for o in group:
+            key = (o.get("name") or "").lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(o)
+
+    # Fill gaps with Gemini when portal/schema/sitemap are thin
+    if len(merged) < 4:
+        for o in offers_from_gemini(brand, host, homepage_html):
+            key = (o.get("name") or "").lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(o)
+
+    return merged[:12]
+
+
+def service_like_pages(page_urls: list[str], host: str, offers: list[dict] | None = None) -> list[str]:
     picked: list[str] = []
     for url in page_urls:
         low = url.lower()
         if site_host(low) != host:
             continue
-        if any(k in low for k in keywords) and url not in picked:
+        if any(h in low for h in _SERVICE_PATH_HINTS) and url not in picked:
             picked.append(url)
-    for tag, text in headings:
-        if tag in ("h2", "h3") and text and len(picked) < 3:
-            slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-            if slug:
-                guess = f"https://{host}/{slug}"
-                if guess not in picked:
-                    picked.append(guess)
+    if offers:
+        for o in offers:
+            u = o.get("url")
+            if u and u not in picked:
+                picked.append(u)
     return picked[:3]
 
 
@@ -914,20 +1144,37 @@ def owned_citations(text: str, host: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def build_search_queries(business: str, host: str, headings: list[tuple[str, str]]) -> list[str]:
+def build_search_queries(business: str, host: str, offers: list[dict]) -> list[str]:
     brand = business.strip() or host.split(".")[0].replace("-", " ").title()
-    queries = [brand, f"{brand} {host.split('.')[0]}"]
-    services: list[str] = []
-    for tag, text in headings:
-        if tag in ("h2", "h3") and 4 < len(text) < 80:
-            services.append(text.strip())
-    for svc in services[:6]:
-        queries.append(svc)
-        queries.append(f"{svc} near me")
-    # Pad to 10 with category-style queries
+    host_label = host.split(".")[0].replace("-", " ")
+    queries = [brand, f"{brand} {host_label}"]
+    for o in offers:
+        name = (o.get("name") or "").strip()
+        if not looks_like_offer_name(name):
+            continue
+        queries.append(name)
+        queries.append(f"{name} near me")
+        if len(queries) >= 10:
+            break
+    # Category-style pads from remaining offer names
+    for o in offers:
+        if len(queries) >= 10:
+            break
+        name = (o.get("name") or "").strip()
+        if name and f"best {name}" not in queries:
+            queries.append(f"best {name}")
     while len(queries) < 10:
         queries.append(f"best {brand.split()[0]} services")
-    return queries[:10]
+    # Dedupe preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for q in queries:
+        key = q.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(q)
+    return out[:10]
 
 
 def build_ai_prompts(business: str, host: str, queries: list[str]) -> list[str]:
@@ -984,6 +1231,7 @@ def audit_visibility(
     *,
     ga_property: str | None = None,
     gsc_site: str | None = None,
+    client: dict | None = None,
 ) -> dict:
     s = session()
     host = site_host(site_url)
@@ -1024,7 +1272,15 @@ def audit_visibility(
             break
 
     schema = schema_types(parser.json_ld)
-    service_pages = service_like_pages(parser.headings, page_urls, host)
+    offers = discover_offers(
+        client=client,
+        brand=brand,
+        host=host,
+        json_ld=parser.json_ld,
+        page_urls=page_urls,
+        homepage_html=homepage.get("text") or "",
+    )
+    service_pages = service_like_pages(page_urls, host, offers)
     extra_ps_urls = [u for u in service_pages if u != final_url][:2]
 
     # PageSpeed
@@ -1034,8 +1290,8 @@ def audit_visibility(
     for u in extra_ps_urls:
         ps_extra.append({"url": u, **pagespeed(u, strategy="mobile")})
 
-    # Search sample via Gemini + Google Search grounding
-    queries = build_search_queries(brand, host, parser.headings)
+    # Search sample via Gemini + Google Search grounding (queries from real offers)
+    queries = build_search_queries(brand, host, offers)
     search_obs: list[dict] = []
     competitors: dict[str, str] = {}
     first_page_hits = 0
@@ -1413,11 +1669,12 @@ def audit_visibility(
             }
         )
 
-    # Offers from headings
-    offers: list[dict] = []
-    for tag, text in parser.headings:
-        if tag in ("h2", "h3") and text and len(text) < 100:
-            offers.append({"name": text, "kind": "Service", "score": None})
+    # Offers already discovered above (portal → schema → sitemap → Gemini)
+    # strip internal source keys for HTML display
+    offer_rows = [
+        {"name": o.get("name"), "kind": o.get("kind") or "Service", "score": o.get("score")}
+        for o in offers
+    ]
 
     # Improvements
     improvements: list[dict] = []
@@ -1549,7 +1806,8 @@ def audit_visibility(
         },
         "at_a_glance": at_a_glance,
         "other_facts": other_facts,
-        "offers": offers[:12],
+        "offers": offer_rows[:12],
+        "offer_sources": sorted({o.get("source") for o in offers if o.get("source")}),
         "search_observations": search_obs,
         "improvements": improvements,
         "competitors": comp_rows[:10],
@@ -1970,8 +2228,8 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
 {spacer(28)}
 <div style="{wrap}">
 <h2 style="{h2}">{lit("Offers · What you offer", C_TEXT)}</h2>
-<p style="{sub}">{lit("Services and products found on the live site. Bars appear only when a visibility score was measured.", C_MUTED)}</p>
-{offers or f"<p style=\"color:{C_MUTED};background:{C_BG};\">{lit('No service headings detected on the homepage.', C_MUTED)}</p>"}
+<p style="{sub}">{lit("Services and products discovered from the client portal, site schema, sitemap service URLs, or AI extraction — not homepage marketing headlines.", C_MUTED)}</p>
+{offers or f"<p style=\"color:{C_MUTED};background:{C_BG};\">{lit('No sellable services detected. Add a portal custom field Services (comma-separated) for this client.', C_MUTED)}</p>"}
 </div>
 {spacer(28)}
 <div style="{wrap}">
@@ -2149,7 +2407,13 @@ def main() -> int:
                 }
             )
         )
-        audit = audit_visibility(site, business, ga_property=ga_prop, gsc_site=gsc_site)
+        audit = audit_visibility(
+            site,
+            business,
+            ga_property=ga_prop,
+            gsc_site=gsc_site,
+            client=client,
+        )
         print(
             json.dumps(
                 {

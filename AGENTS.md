@@ -59,7 +59,7 @@ If you only store a short GCP API key string, the script will detect the secret 
 | Search Console metrics | GSC searchAnalytics (28 days) when auth succeeds |
 | Analytics | GA4 runReport sessions/users (28 days) when auth succeeds |
 | Listings | Places API |
-| Content / structure | Homepage crawl + sitemap |
+| Offers | Portal `Services` field → schema → sitemap service URLs → Gemini (never raw H2/H3 slogans) |
 
 ## Pilot clients
 
