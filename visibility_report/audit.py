@@ -25,12 +25,20 @@ from .google_apis import (
     gemini_ask,
     gemini_search_ranking,
     geocode_address,
+    is_platform_competitor_host,
     owned_citations,
     pagespeed,
     places_lookup,
 )
 from .offers import discover_offers, service_like_pages
-from .portal import origin, site_host
+from .portal import (
+    gbp_name_from_client,
+    gbp_url_from_client,
+    main_keyword_from_client,
+    origin,
+    primary_city_from_client,
+    site_host,
+)
 from .scoring import (
     build_ai_prompts,
     build_search_queries,
@@ -105,7 +113,11 @@ def audit_visibility(
         ps_extra.append({"url": u, **pagespeed(u, strategy="mobile")})
 
     # Search sample via Gemini + Google Search grounding (queries from real offers)
-    queries = build_search_queries(brand, host, offers)
+    city = primary_city_from_client(client)
+    main_kw = main_keyword_from_client(client)
+    queries = build_search_queries(
+        brand, host, offers, city=city, main_keyword=main_kw
+    )
     search_obs: list[dict] = []
     competitors: dict[str, str] = {}
     first_page_hits = 0
@@ -138,8 +150,19 @@ def audit_visibility(
         elif not gemini_key():
             note = "Search sample skipped — gemini_api not configured."
         for ch in sample.get("competitors") or []:
+            if is_platform_competitor_host(ch):
+                continue
             competitors[ch] = f"https://{ch}"
-        search_obs.append({"query": q, "score": score, "position": pos, "found": found, "note": note})
+        search_obs.append(
+            {
+                "query": q,
+                "score": score,
+                "position": pos,
+                "found": found,
+                "note": note,
+                "branded": brand.lower() in q.lower(),
+            }
+        )
 
     # Gemini AI answer sample (buyer prompts)
     ai_prompts = build_ai_prompts(brand, host, queries)
@@ -163,8 +186,14 @@ def audit_visibility(
                     ai_competitors.append(w)
         time.sleep(0.5)
 
-    # Places / listings (+ optional geocode check)
-    places = places_lookup(brand, final_url)
+    # Places / listings (+ optional geocode check); prefer portal GBP name/city
+    places = places_lookup(
+        brand,
+        final_url,
+        gbp_name=gbp_name_from_client(client),
+        gbp_url=gbp_url_from_client(client),
+        city=city,
+    )
     geocoded = geocode_address(places.get("address", "")) if places.get("ok") else {"ok": False}
     listings_score = 0
     if places.get("ok"):
@@ -180,6 +209,15 @@ def audit_visibility(
     # Search Console + Google Analytics (Runtime Secrets: search_console_api, analytics_data_api)
     gsc_data = fetch_search_console(final_url, gsc_override=gsc_site)
     ga_data = fetch_analytics(ga_property)
+
+    # Soften branded "not found" notes when GSC proves brand impressions/clicks
+    if gsc_data.get("ok") and (gsc_data.get("total_clicks") or gsc_data.get("total_impressions")):
+        for row in search_obs:
+            if row.get("branded") and not row.get("found"):
+                row["note"] = (
+                    "Sample did not confirm host URL; Search Console still shows "
+                    "branded/site traffic in the last 28 days."
+                )
 
     # Component scores
     search_score = score_from_ratio(first_page_hits, len(queries))
@@ -479,7 +517,7 @@ def audit_visibility(
             {
                 "label": "Google Analytics",
                 "status": "Watch",
-                "detail": "Not connected — add analytics_data_api and analytics_property_id.",
+                "detail": "Not connected — add analytics_data_api and a portal GA4 URL / property ID.",
             }
         )
 
@@ -593,14 +631,44 @@ def audit_visibility(
 
     comp_rows = []
     seen = set()
-    for ch, link in list(competitors.items())[:10]:
-        if ch in seen:
+    _ai_noise = {
+        "youtube",
+        "facebook",
+        "instagram",
+        "reddit",
+        "google",
+        "zillow",
+        "wikipedia",
+        "linkedin",
+        "twitter",
+        "tiktok",
+        "yelp",
+        "quora",
+        "chatgpt",
+        "gemini",
+    }
+    for ch, link in list(competitors.items())[:15]:
+        if is_platform_competitor_host(ch) or ch in seen:
             continue
         seen.add(ch)
-        comp_rows.append({"name": ch.split(".")[0].title(), "site": ch, "link": link, "notes": "Observed in search sample."})
-    for name in ai_competitors[:5]:
-        if name.lower() not in seen:
-            comp_rows.append({"name": name, "site": "", "link": "", "notes": "Named in Gemini sample."})
+        comp_rows.append(
+            {
+                "name": ch.split(".")[0].title(),
+                "site": ch,
+                "link": link,
+                "notes": "Observed in search sample.",
+            }
+        )
+        if len(comp_rows) >= 10:
+            break
+    for name in ai_competitors[:8]:
+        key = name.lower().strip()
+        if key in seen or key in _ai_noise or any(n in key for n in _ai_noise):
+            continue
+        seen.add(key)
+        comp_rows.append({"name": name, "site": "", "link": "", "notes": "Named in Gemini sample."})
+        if len(comp_rows) >= 10:
+            break
 
     return {
         "site_url": site_url,

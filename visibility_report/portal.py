@@ -154,6 +154,54 @@ def gsc_site_from_client(client: dict) -> str | None:
     return parse_gsc_site_url(raw) or None
 
 
+def gbp_name_from_client(client: dict | None) -> str | None:
+    if not client:
+        return None
+    return custom_field_value(
+        client,
+        "GBP Name",
+        "Google Business Profile Name",
+        "Business Profile Name",
+        "gbp name",
+    )
+
+
+def gbp_url_from_client(client: dict | None) -> str | None:
+    if not client:
+        return None
+    return custom_field_value(
+        client,
+        "GBP URL",
+        "Google Business Profile URL",
+        "Google Business URL",
+        "Maps URL",
+        "gbp url",
+    )
+
+
+def primary_city_from_client(client: dict | None) -> str | None:
+    if not client:
+        return None
+    return custom_field_value(
+        client,
+        "Primary City",
+        "City",
+        "Location",
+        "primary city",
+    )
+
+
+def main_keyword_from_client(client: dict | None) -> str | None:
+    if not client:
+        return None
+    return custom_field_value(
+        client,
+        "Main Keyword",
+        "Primary Keyword",
+        "main keyword",
+    )
+
+
 def list_clients() -> list[dict]:
     """Fetch portal clients (handles list or paginated dict responses)."""
     status, body = api_get("/clients")

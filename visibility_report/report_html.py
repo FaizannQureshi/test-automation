@@ -265,10 +265,12 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
     offer_list = audit.get("offers") or []
     for i, o in enumerate(offer_list):
         sc = o.get("score")
-        sc_txt = lit(str(sc), C_MUTED) if sc is not None else lit("0", C_MUTED)
+        name_html = lit(o.get("name", ""), C_TEXT)
+        if sc is not None:
+            name_html = name_html + " " + lit(str(sc), C_MUTED)
         offers += f"""<table style="width:100%;border-collapse:collapse;background:{C_CARD};border:1px solid {C_BORDER};border-radius:8px;">
 <tr>
-{cell(lit(o.get("name", ""), C_TEXT) + " " + sc_txt, bg=C_CARD)}
+{cell(name_html, bg=C_CARD)}
 {cell(lit(o.get("kind", ""), C_MUTED), bg=C_CARD, align="right", color=C_MUTED, size="12px")}
 </tr>
 </table>"""

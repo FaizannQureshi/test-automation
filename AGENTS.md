@@ -49,9 +49,11 @@ Optional: `GEMINI_MODEL` (default `gemini-3.6-flash`). Optional global fallback:
 
 | Custom field name | Example | Purpose |
 |---|---|---|
-| `Services` | `FHA loans, Refinance, VA loans` | Preferred Offers + search queries |
+| `Services` | `FHA loans, Refinance, VA loans` | Preferred Offers + search queries (optional) |
 | `GA4 URL` / `GA4 Property ID` | analytics admin URL or `458571033` | Client’s GA4 property |
 | `GSC URL` / `Search Console Site URL` | GSC users URL or `sc-domain:example.com` | Exact GSC property |
+| `GBP Name` / `GBP URL` | Profile name or business.google.com link | Improves Listings / Places match |
+| `Primary City` / `Main Keyword` | `Roseville, CA` / `mortgage lender` | Better local search queries |
 
 ### Search Console + Analytics credentials
 

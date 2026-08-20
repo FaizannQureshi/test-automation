@@ -93,6 +93,10 @@ If `client_id` is set in config, that id is used directly. If only `website_host
 5. `python3 weekly_seo_report.py`
 6. Pilot client only (Amy DeBusk). Creates a new RICH_TEXT report; do not overwrite prior reports.
 7. Expect `apiNotes.service_account_email` like `seo-report-service@….iam.gserviceaccount.com`. That email must already have GSC + GA Viewer (or better) on the client’s properties.
+8. Light QA after the run (do not rewrite report HTML):
+   - Offers should look like sellable services (not GPT/calc/planner tools).
+   - Compare should not be dominated by YouTube/Facebook/Reddit/Zillow.
+   - If Offers look wrong, report that as a package bug — do not invent a replacement Offers list in the prompt.
 
 ## After execution
 

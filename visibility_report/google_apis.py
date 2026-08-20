@@ -85,6 +85,56 @@ def parse_search_verdict(text: str, host: str) -> tuple[bool, int | None, list[s
     return found, pos, competitors[:5]
 
 
+# Domains that show up in search samples but are not peer competitors
+_PLATFORM_COMPETITOR_HOSTS = frozenset(
+    {
+        "youtube.com",
+        "youtu.be",
+        "facebook.com",
+        "fb.com",
+        "instagram.com",
+        "twitter.com",
+        "x.com",
+        "reddit.com",
+        "linkedin.com",
+        "tiktok.com",
+        "pinterest.com",
+        "google.com",
+        "maps.google.com",
+        "goo.gl",
+        "bing.com",
+        "yahoo.com",
+        "wikipedia.org",
+        "yelp.com",
+        "apple.com",
+        "maptons.com",
+        "zillow.com",
+        "realtor.com",
+        "redfin.com",
+        "trulia.com",
+        "bankrate.com",
+        "nerdwallet.com",
+        "investopedia.com",
+        "quora.com",
+        "medium.com",
+        "craigslist.org",
+        "bbb.org",
+        "angi.com",
+        "thumbtack.com",
+    }
+)
+
+
+def is_platform_competitor_host(host: str) -> bool:
+    h = (host or "").lower().removeprefix("www.")
+    if not h:
+        return True
+    if h in _PLATFORM_COMPETITOR_HOSTS:
+        return True
+    # Catch maps.google.co.uk style and cdn subdomains of platforms
+    return any(h == p or h.endswith("." + p) for p in _PLATFORM_COMPETITOR_HOSTS)
+
+
 def gemini_search_ranking(query: str, brand: str, host: str) -> dict:
     """Sample Google search visibility via Gemini + Google Search grounding."""
     prompt = (
@@ -93,11 +143,13 @@ def gemini_search_ranking(query: str, brand: str, host: str) -> dict:
         "Reply with exactly these lines first:\n"
         "FOUND=yes or FOUND=no\n"
         "POSITION=<number 1-20 or none>\n"
-        "Then briefly note up to 5 other domains that ranked instead."
+        "Then briefly note up to 5 other *business* domains that ranked "
+        "(not YouTube, Facebook, Reddit, Zillow, Google, or similar platforms)."
     )
     resp = gemini_ask(prompt, use_search=True)
     text = resp.get("text") or ""
     found, pos, competitors = parse_search_verdict(text, host)
+    competitors = [c for c in competitors if not is_platform_competitor_host(c)]
     return {
         "ok": resp.get("ok", False),
         "text": text,
@@ -108,50 +160,92 @@ def gemini_search_ranking(query: str, brand: str, host: str) -> dict:
     }
 
 
-def places_lookup(business_name: str, website: str) -> dict:
+def places_lookup(
+    business_name: str,
+    website: str,
+    *,
+    gbp_name: str | None = None,
+    gbp_url: str | None = None,
+    city: str | None = None,
+) -> dict:
     key = google_key("PLACES")
     if not key:
         return {"ok": False, "error": "places_api not set"}
     host = site_host(website)
-    query = business_name or host
+    name = (gbp_name or business_name or "").strip() or host
+    queries: list[str] = []
+    if name and city:
+        queries.append(f"{name} {city}")
+    if name and host:
+        queries.append(f"{name} {host}")
+    if name:
+        queries.append(name)
+    if business_name and business_name.strip().lower() != name.lower():
+        queries.append(business_name.strip())
+    queries.append(host)
+    # Dedupe preserving order
+    seen_q: set[str] = set()
+    query_list = []
+    for q in queries:
+        k = q.lower()
+        if k not in seen_q:
+            seen_q.add(k)
+            query_list.append(q)
+
+    field_mask = (
+        "places.displayName,places.formattedAddress,places.rating,"
+        "places.userRatingCount,places.websiteUri,places.nationalPhoneNumber,"
+        "places.types,places.googleMapsUri"
+    )
     try:
-        r = requests.post(
-            "https://places.googleapis.com/v1/places:searchText",
-            headers={
-                "Content-Type": "application/json",
-                "X-Goog-Api-Key": key,
-                "X-Goog-FieldMask": (
-                    "places.displayName,places.formattedAddress,places.rating,"
-                    "places.userRatingCount,places.websiteUri,places.nationalPhoneNumber,"
-                    "places.types,places.googleMapsUri"
-                ),
-            },
-            json={"textQuery": query, "pageSize": 5},
-            timeout=30,
-        )
-        if r.status_code != 200:
-            return {"ok": False, "error": f"HTTP {r.status_code}"}
-        places = r.json().get("places") or []
         match = None
-        for p in places:
-            uri = (p.get("websiteUri") or "").lower()
-            if host in uri or not uri:
-                match = p
-                if host in uri:
+        last_error = ""
+        for query in query_list[:4]:
+            r = requests.post(
+                "https://places.googleapis.com/v1/places:searchText",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Api-Key": key,
+                    "X-Goog-FieldMask": field_mask,
+                },
+                json={"textQuery": query, "pageSize": 5},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code}"
+                continue
+            places = r.json().get("places") or []
+            for p in places:
+                uri = (p.get("websiteUri") or "").lower()
+                if host and host in uri:
+                    match = p
                     break
-        if not match and places:
-            match = places[0]
+            if match:
+                break
+            if not match and places:
+                # Prefer a result whose name overlaps the GBP/business name
+                want = name.lower()
+                for p in places:
+                    disp = ((p.get("displayName") or {}).get("text") or "").lower()
+                    if want and (want in disp or disp in want):
+                        match = p
+                        break
+                if not match:
+                    match = places[0]
+                break
         if not match:
-            return {"ok": False, "error": "No listing found"}
+            return {"ok": False, "error": last_error or "No listing found"}
         return {
             "ok": True,
-            "name": (match.get("displayName") or {}).get("text") or business_name,
+            "name": (match.get("displayName") or {}).get("text") or name,
             "address": match.get("formattedAddress") or "",
             "rating": match.get("rating"),
             "review_count": match.get("userRatingCount"),
             "phone": match.get("nationalPhoneNumber") or "",
             "website": match.get("websiteUri") or "",
+            "maps_uri": match.get("googleMapsUri") or gbp_url or "",
             "types": match.get("types") or [],
+            "query_used": query_list[0] if query_list else name,
         }
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
