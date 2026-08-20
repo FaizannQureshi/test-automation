@@ -49,10 +49,15 @@ def env(*keys: str) -> str:
 
 # v1 Cloud env secret names (lowercase) + legacy uppercase aliases.
 _SERVICE_KEYS: dict[str, tuple[str, ...]] = {
-    "PAGESPEED": ("pagespeed_api", "GOOGLE_PAGESPEED_API_KEY", "GOOGLE_API_KEY"),
-    "PLACES": ("places_api", "GOOGLE_PLACES_API_KEY", "GOOGLE_API_KEY"),
-    "GEOCODING": ("geocoding_api", "GOOGLE_GEOCODING_API_KEY", "GOOGLE_API_KEY"),
-    "CUSTOM_SEARCH": ("custom_search_api", "GOOGLE_CUSTOM_SEARCH_API_KEY", "GOOGLE_API_KEY"),
+    "PAGESPEED": ("pagespeed_api", "PAGESPEED_API", "GOOGLE_PAGESPEED_API_KEY", "GOOGLE_API_KEY"),
+    "PLACES": ("places_api", "PLACES_API", "GOOGLE_PLACES_API_KEY", "GOOGLE_API_KEY"),
+    "GEOCODING": ("geocoding_api", "GEOCODING_API", "GOOGLE_GEOCODING_API_KEY", "GOOGLE_API_KEY"),
+    "CUSTOM_SEARCH": (
+        "custom_search_api",
+        "CUSTOM_SEARCH_API",
+        "GOOGLE_CUSTOM_SEARCH_API_KEY",
+        "GOOGLE_API_KEY",
+    ),
 }
 
 
@@ -63,19 +68,58 @@ def google_key(service: str = "") -> str:
 
 
 def gemini_key() -> str:
-    return env("gemini_api", "GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY")
+    return env(
+        "gemini_api",
+        "GEMINI_API",
+        "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_API_KEY",
+    )
 
 
 def cse_id() -> str:
     return env("GOOGLE_CSE_ID", "GOOGLE_CUSTOM_SEARCH_ENGINE_ID")
 
 
+def gsc_secret() -> str:
+    return env(
+        "search_console_api",
+        "SEARCH_CONSOLE_API",
+        "GOOGLE_SEARCH_CONSOLE_CREDENTIALS_JSON",
+        "GSC_CREDENTIALS_JSON",
+    )
+
+
+def ga_secret() -> str:
+    return env(
+        "analytics_data_api",
+        "ANALYTICS_DATA_API",
+        "GOOGLE_ANALYTICS_CREDENTIALS_JSON",
+        "GA_CREDENTIALS_JSON",
+    )
+
+
+def analytics_property_id() -> str:
+    raw = env(
+        "analytics_property_id",
+        "GOOGLE_ANALYTICS_PROPERTY_ID",
+        "GA4_PROPERTY_ID",
+    )
+    if not raw:
+        return ""
+    raw = raw.strip()
+    if raw.isdigit():
+        return f"properties/{raw}"
+    if not raw.startswith("properties/"):
+        return f"properties/{raw}"
+    return raw
+
+
 def gsc_configured() -> bool:
-    return bool(env("GOOGLE_SEARCH_CONSOLE_CREDENTIALS_JSON", "GSC_CREDENTIALS_JSON"))
+    return bool(gsc_secret())
 
 
 def ga_configured() -> bool:
-    return bool(env("GOOGLE_ANALYTICS_PROPERTY_ID", "GA4_PROPERTY_ID"))
+    return bool(ga_secret()) and bool(analytics_property_id())
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +171,60 @@ def website_url_from_client(client: dict) -> str | None:
             val = (field.get("value") or "").strip()
             return val or None
     return None
+
+
+def custom_field_value(client: dict, *names: str) -> str | None:
+    """Find a custom field value by case-insensitive name (any category)."""
+    wanted = {n.strip().lower() for n in names}
+    for field in client.get("customFields") or []:
+        name = (field.get("name") or "").strip().lower()
+        if name in wanted:
+            val = (field.get("value") or "").strip()
+            if val:
+                return val
+    return None
+
+
+def ga_property_from_client(client: dict) -> str:
+    raw = custom_field_value(
+        client,
+        "GA4 Property ID",
+        "Analytics Property ID",
+        "Google Analytics Property ID",
+        "analytics property id",
+        "ga4 property id",
+    )
+    if not raw:
+        return analytics_property_id()
+    raw = raw.strip()
+    if raw.isdigit():
+        return f"properties/{raw}"
+    if not raw.startswith("properties/"):
+        return f"properties/{raw}"
+    return raw
+
+
+def gsc_site_from_client(client: dict) -> str | None:
+    return custom_field_value(
+        client,
+        "Search Console Site URL",
+        "Search Console Property",
+        "GSC Site URL",
+        "search console site url",
+        "gsc property",
+    )
+
+
+def normalize_gsc_site(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("sc-domain:"):
+        return raw
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw if raw.endswith("/") else raw + "/"
+    if "." in raw and not raw.startswith("sc-domain:"):
+        host = raw.removeprefix("www.")
+        return f"sc-domain:{host}"
+    return raw
 
 
 def normalize_site_url(raw: str) -> str:
@@ -558,7 +656,7 @@ def gemini_ask(prompt: str, *, use_search: bool = False) -> dict:
     key = gemini_key()
     if not key:
         return {"ok": False, "error": "gemini_api not set", "text": "", "grounding_urls": []}
-    model = env("GEMINI_MODEL") or "gemini-2.0-flash"
+    model = env("GEMINI_MODEL") or "gemini-3.6-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body: dict[str, Any] = {"contents": [{"parts": [{"text": prompt}]}]}
     if use_search:
@@ -580,6 +678,225 @@ def gemini_ask(prompt: str, *, use_search: bool = False) -> dict:
         return {"ok": True, "text": text, "error": None, "grounding_urls": grounding_urls}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200], "text": "", "grounding_urls": []}
+
+
+# ---------------------------------------------------------------------------
+# Search Console + Google Analytics (OAuth via secret — API key or service account JSON)
+# ---------------------------------------------------------------------------
+
+GSC_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
+GA_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+
+
+def _access_token_for_secret(secret: str, scopes: list[str]) -> tuple[str | None, str | None]:
+    """Obtain a bearer token from search_console_api / analytics_data_api secret."""
+    secret = (secret or "").strip()
+    if not secret:
+        return None, "secret not set"
+
+    # Service account JSON stored in the Runtime Secret
+    if secret.startswith("{"):
+        try:
+            info = json.loads(secret)
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+
+            creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+            creds.refresh(GoogleAuthRequest())
+            return creds.token, None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {str(e)[:160]}"
+
+    # Plain GCP API key — Google does not accept API keys alone for GSC / GA4 data access.
+    return (
+        None,
+        "Plain API keys are not supported for Search Console / Analytics data. "
+        "Store service account JSON in search_console_api / analytics_data_api, "
+        "and grant that service account access to the property.",
+    )
+
+
+def gsc_site_url_candidates(site_url: str) -> list[str]:
+    host = site_host(site_url)
+    parsed = urlparse(site_url)
+    base_https = urlunparse(("https", parsed.netloc.lower(), "/", "", "", ""))
+    candidates = [
+        f"sc-domain:{host}",
+        base_https,
+        f"https://{host}/",
+        f"https://www.{host}/",
+        site_url.rstrip("/") + "/",
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def fetch_search_console(site_url: str, *, gsc_override: str | None = None) -> dict:
+    secret = gsc_secret()
+    if not secret:
+        return {"ok": False, "error": "search_console_api not set", "queries": []}
+    token, err = _access_token_for_secret(secret, [GSC_SCOPE])
+    if not token:
+        return {"ok": False, "error": err or "auth failed", "queries": []}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        sites_resp = requests.get(
+            "https://www.googleapis.com/webmasters/v3/sites",
+            headers=headers,
+            timeout=30,
+        )
+        if sites_resp.status_code != 200:
+            return {
+                "ok": False,
+                "error": f"sites list HTTP {sites_resp.status_code}",
+                "queries": [],
+            }
+        site_entries = sites_resp.json().get("siteEntry") or []
+        permitted = {e.get("siteUrl") for e in site_entries if e.get("siteUrl")}
+        chosen = None
+        if gsc_override:
+            override = normalize_gsc_site(gsc_override)
+            if override in permitted:
+                chosen = override
+            else:
+                host = site_host(override.replace("sc-domain:", "https://" + override.split(":", 1)[-1]))
+                for p in permitted:
+                    if host in p or override in p:
+                        chosen = p
+                        break
+        if not chosen:
+            for candidate in gsc_site_url_candidates(site_url):
+                if candidate in permitted:
+                    chosen = candidate
+                    break
+        if not chosen and permitted:
+            host = site_host(site_url)
+            for p in permitted:
+                if host in p:
+                    chosen = p
+                    break
+        if not chosen:
+            available = ", ".join(sorted(permitted)[:6]) if permitted else "none"
+            return {
+                "ok": False,
+                "error": (
+                    f"No matching Search Console property for {site_url}. "
+                    f"Properties this service account can access: {available}. "
+                    "Add the service account email in Search Console → Settings → Users, "
+                    "or set a client custom field Search Console Site URL to the exact property "
+                    "(e.g. sc-domain:example.com or https://www.example.com/)."
+                ),
+                "queries": [],
+                "available_properties": sorted(permitted),
+            }
+        end = TODAY - timedelta(days=1)
+        start = end - timedelta(days=27)
+        body = {
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
+            "dimensions": ["query"],
+            "rowLimit": 15,
+        }
+        q_resp = requests.post(
+            f"https://www.googleapis.com/webmasters/v3/sites/{quote(chosen, safe='')}/searchAnalytics/query",
+            headers={**headers, "Content-Type": "application/json"},
+            json=body,
+            timeout=45,
+        )
+        if q_resp.status_code != 200:
+            return {
+                "ok": False,
+                "error": f"searchAnalytics HTTP {q_resp.status_code}",
+                "queries": [],
+                "siteUrl": chosen,
+            }
+        rows = q_resp.json().get("rows") or []
+        queries = []
+        for row in rows:
+            keys = row.get("keys") or []
+            query = keys[0] if keys else ""
+            pos = row.get("position")
+            queries.append(
+                {
+                    "query": query,
+                    "clicks": row.get("clicks", 0),
+                    "impressions": row.get("impressions", 0),
+                    "position": round(pos, 1) if pos is not None else None,
+                    "ctr": row.get("ctr"),
+                }
+            )
+        total_clicks = sum(q.get("clicks", 0) for q in queries)
+        total_impressions = sum(q.get("impressions", 0) for q in queries)
+        return {
+            "ok": True,
+            "error": None,
+            "siteUrl": chosen,
+            "queries": queries,
+            "total_clicks": total_clicks,
+            "total_impressions": total_impressions,
+            "period": f"{start.isoformat()} to {end.isoformat()}",
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200], "queries": []}
+
+
+def fetch_analytics(property_id: str | None = None) -> dict:
+    secret = ga_secret()
+    prop = (property_id or "").strip() or analytics_property_id()
+    if not secret:
+        return {"ok": False, "error": "analytics_data_api not set"}
+    if not prop:
+        return {"ok": False, "error": "analytics_property_id not set (env or client GA4 Property ID custom field)"}
+    token, err = _access_token_for_secret(secret, [GA_SCOPE])
+    if not token:
+        return {"ok": False, "error": err or "auth failed"}
+    end = TODAY - timedelta(days=1)
+    start = end - timedelta(days=27)
+    body = {
+        "dateRanges": [{"startDate": start.isoformat(), "endDate": end.isoformat()}],
+        "metrics": [{"name": "sessions"}, {"name": "activeUsers"}, {"name": "screenPageViews"}],
+    }
+    try:
+        r = requests.post(
+            f"https://analyticsdata.googleapis.com/v1beta/{prop}:runReport",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=45,
+        )
+        if r.status_code != 200:
+            hint = ""
+            if r.status_code == 403:
+                hint = (
+                    " — grant the service account email Viewer access on this GA4 property "
+                    "(Admin → Property access management) and enable Google Analytics Data API in GCP."
+                )
+            return {"ok": False, "error": f"runReport HTTP {r.status_code}{hint}", "property": prop}
+        data = r.json()
+        values = []
+        if data.get("rows"):
+            values = data["rows"][0].get("metricValues") or []
+        sessions = int(values[0].get("value", "0")) if len(values) > 0 else 0
+        users = int(values[1].get("value", "0")) if len(values) > 1 else 0
+        pageviews = int(values[2].get("value", "0")) if len(values) > 2 else 0
+        return {
+            "ok": True,
+            "error": None,
+            "property": prop,
+            "sessions": sessions,
+            "active_users": users,
+            "pageviews": pageviews,
+            "period": f"{start.isoformat()} to {end.isoformat()}",
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
 
 
 def brand_mentioned(text: str, brand: str, host: str) -> bool:
@@ -661,7 +978,13 @@ def score_from_ratio(found: int, total: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def audit_visibility(site_url: str, business_name: str) -> dict:
+def audit_visibility(
+    site_url: str,
+    business_name: str,
+    *,
+    ga_property: str | None = None,
+    gsc_site: str | None = None,
+) -> dict:
     s = session()
     host = site_host(site_url)
     brand = business_name.strip() or host.split(".")[0].replace("-", " ").title()
@@ -784,8 +1107,20 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
             listings_score += 10
     listings_score = clamp_score(listings_score)
 
+    # Search Console + Google Analytics (Runtime Secrets: search_console_api, analytics_data_api)
+    gsc_data = fetch_search_console(final_url, gsc_override=gsc_site)
+    ga_data = fetch_analytics(ga_property)
+
     # Component scores
     search_score = score_from_ratio(first_page_hits, len(queries))
+    if gsc_data.get("ok") and gsc_data.get("queries"):
+        gsc_on_page = sum(
+            1 for q in gsc_data["queries"][:10] if (q.get("position") or 99) <= 10
+        )
+        gsc_score = score_from_ratio(gsc_on_page, min(len(gsc_data["queries"]), 10))
+        search_score = max(search_score, gsc_score)
+        if search_method.startswith("Gemini"):
+            search_method = "Gemini sample + Search Console (28-day)"
     ai_score = score_from_ratio(gemini_mentions, len(ai_prompts))
 
     content_pts = 0
@@ -852,8 +1187,11 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
         gaps.append("AI answer engines name other firms on generic questions")
     if site_health_score < 60:
         gaps.append("mobile site speed needs work before traffic converts")
-    if not gsc_configured():
-        gaps.append("Search Console is not connected — ranks are Gemini search samples only")
+    if not gsc_data.get("ok"):
+        if gsc_configured():
+            gaps.append("Search Console is configured but returned no data for this property")
+        else:
+            gaps.append("Search Console is not connected — ranks are Gemini search samples only")
     if gaps:
         opportunity = "Clear opportunity. " + " ".join(g.capitalize() + "." for g in gaps[:2])
     elif overall >= 70:
@@ -922,9 +1260,41 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
             "label": f"First-page presence ({len(queries)}-query sample)",
             "value": f"{first_page_hits} of {len(queries)}",
             "status": metric_status("higher_is_better", first_page_hits, good=7, warn=3),
-            "note": f"Web-search sample via {search_method}. Not Search Console ranks.",
+            "note": (
+                f"Web-search sample via {search_method}."
+                if gsc_data.get("ok")
+                else f"Web-search sample via {search_method}. Not Search Console ranks."
+            ),
         }
     )
+    if gsc_data.get("ok"):
+        at_a_glance.append(
+            {
+                "label": "Search Console clicks (28 days)",
+                "value": str(gsc_data.get("total_clicks", 0)),
+                "status": metric_status(
+                    "higher_is_better", gsc_data.get("total_clicks", 0), good=50, warn=10
+                ),
+                "note": (
+                    f"{gsc_data.get('total_impressions', 0)} impressions · "
+                    f"{gsc_data.get('period', '')} · property {gsc_data.get('siteUrl', '')}"
+                ),
+            }
+        )
+    if ga_data.get("ok"):
+        at_a_glance.append(
+            {
+                "label": "Analytics sessions (28 days)",
+                "value": str(ga_data.get("sessions", 0)),
+                "status": metric_status(
+                    "higher_is_better", ga_data.get("sessions", 0), good=500, warn=100
+                ),
+                "note": (
+                    f"{ga_data.get('active_users', 0)} active users · "
+                    f"{ga_data.get('pageviews', 0)} pageviews · {ga_data.get('period', '')}"
+                ),
+            }
+        )
     at_a_glance.append(
         {
             "label": "Gemini mentions (sampled prompts)",
@@ -980,20 +1350,66 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
                     "detail": geocoded.get("formatted") or places.get("address") or "",
                 }
             )
-    if not gsc_configured():
+    if gsc_data.get("ok"):
+        other_facts.append(
+            {
+                "label": "Search Console",
+                "status": "On track",
+                "detail": (
+                    f"{gsc_data.get('total_clicks', 0)} clicks and "
+                    f"{gsc_data.get('total_impressions', 0)} impressions in the last 28 days."
+                ),
+            }
+        )
+    elif gsc_configured():
         other_facts.append(
             {
                 "label": "Search Console",
                 "status": "Watch",
-                "detail": "Not connected — connect for true Google position history.",
+                "detail": gsc_data.get("error") or "search_console_api set but no data returned.",
             }
         )
-    if not ga_configured():
+    else:
+        other_facts.append(
+            {
+                "label": "Search Console",
+                "status": "Watch",
+                "detail": "Not connected — add search_console_api Runtime Secret.",
+            }
+        )
+    if ga_data.get("ok"):
+        other_facts.append(
+            {
+                "label": "Google Analytics",
+                "status": "On track",
+                "detail": (
+                    f"{ga_data.get('sessions', 0)} sessions, "
+                    f"{ga_data.get('active_users', 0)} active users (28 days)."
+                ),
+            }
+        )
+    elif ga_configured():
         other_facts.append(
             {
                 "label": "Google Analytics",
                 "status": "Watch",
-                "detail": "Not connected — traffic trends unavailable in this snapshot.",
+                "detail": ga_data.get("error") or "analytics_data_api set but no data returned.",
+            }
+        )
+    elif ga_secret():
+        other_facts.append(
+            {
+                "label": "Google Analytics",
+                "status": "Watch",
+                "detail": "Set analytics_property_id (GA4 property ID) alongside analytics_data_api.",
+            }
+        )
+    else:
+        other_facts.append(
+            {
+                "label": "Google Analytics",
+                "status": "Watch",
+                "detail": "Not connected — add analytics_data_api and analytics_property_id.",
             }
         )
 
@@ -1148,13 +1564,18 @@ def audit_visibility(site_url: str, business_name: str) -> dict:
         "meta_desc": meta_desc,
         "api_notes": {
             "gsc": gsc_configured(),
+            "gsc_ok": bool(gsc_data.get("ok")),
+            "gsc_error": (gsc_data.get("error") or "")[:120] if not gsc_data.get("ok") else "",
             "ga": ga_configured(),
+            "ga_ok": bool(ga_data.get("ok")),
+            "ga_error": (ga_data.get("error") or "")[:120] if not ga_data.get("ok") else "",
             "pagespeed": bool(google_key("PAGESPEED")),
             "gemini": bool(gemini_key()),
             "places": bool(google_key("PLACES")),
             "geocoding": bool(google_key("GEOCODING")),
             "search_method": search_method,
         },
+        "gsc_queries": gsc_data.get("queries") or [],
     }
 
 
@@ -1168,20 +1589,213 @@ def esc(s: Any) -> str:
 
 
 def status_color(status: str) -> str:
-    return {"On track": "#059669", "Watch": "#D97706", "Fix": "#DC2626"}.get(status, "#64748B")
+    return {
+        "On track": "#6EE7B7",
+        "Watch": "#FCD34D",
+        "Fix": "#FCA5A5",
+    }.get(status, "#94A3B8")
 
 
-def score_bar(label: str, score: int, desc: str) -> str:
-    color = "#059669" if score >= 70 else ("#D97706" if score >= 40 else "#DC2626")
-    return f"""
-<div style="margin:0 0 16px;">
-<p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#0F172A;">{esc(label)}</p>
-<p style="margin:0 0 8px;font-size:12px;color:#64748B;line-height:1.45;">{esc(desc)}</p>
-<div style="background:#E2E8F0;border-radius:6px;height:10px;overflow:hidden;">
-<div style="width:{score}%;background:{color};height:10px;border-radius:6px;"></div>
+# Oasbit palette (dark theme — matches oasbit.com visibility report)
+C_BG = "#101218"
+C_PANEL = "#0B1220"
+C_CARD = "#161B26"
+C_CELL = "#1E293B"
+C_BORDER = "#334155"
+C_TEXT = "#F8FAFC"
+C_BODY = "#E8E6F2"
+C_MUTED = "#9CA3AF"
+C_VIOLET = "#C4B5FD"
+C_LINK = "#A5B4FC"
+
+
+# ---------------------------------------------------------------------------
+# NOTE on inline styling constraints (Connection Inc RICH_TEXT sanitizer)
+# ---------------------------------------------------------------------------
+# Survives: color, background (solid hex), font-*, line-height, letter-spacing,
+#           text-align, width, height, padding, border, border-radius, border-collapse
+# Stripped: margin, display (flex/grid/inline-block), text-transform, tr background,
+#           single-side borders, gradients/rgba backgrounds
+# Portal also forces dark navy on table areas — always set color+background on
+# every td/th and wrap copy in <span style="color:…"> so text stays visible.
+
+
+def spacer(px: int) -> str:
+    return f'<div style="height:{px}px;background:{C_BG};"></div>'
+
+
+def lit(text: Any, color: str = C_TEXT) -> str:
+    return f'<span style="color:{color};">{esc(text)}</span>'
+
+
+def cell(
+    content: str,
+    *,
+    header: bool = False,
+    bg: str = C_CELL,
+    color: str = C_TEXT,
+    align: str = "left",
+    size: str = "14px",
+    weight: str = "400",
+) -> str:
+    tag = "th" if header else "td"
+    return (
+        f'<{tag} style="padding:10px 12px;color:{color};background:{bg};'
+        f'border:1px solid {C_BORDER};text-align:{align};font-size:{size};font-weight:{weight};">'
+        f"{content}</{tag}>"
+    )
+
+
+def score_tier_color(score: int) -> str:
+    if score >= 70:
+        return "#6EE7B7"
+    if score >= 40:
+        return "#FCD34D"
+    return "#FCA5A5"
+
+
+def priority_badge(priority: str) -> str:
+    p = (priority or "").lower()
+    if "first" in p:
+        bg, fg = "#7F1D1D", "#FCA5A5"
+    elif "important" in p:
+        bg, fg = "#78350F", "#FCD34D"
+    else:
+        bg, fg = "#1E3A5F", "#93C5FD"
+    label = esc((priority or "").upper())
+    return (
+        f'<span style="padding:3px 10px;font-size:10px;font-weight:700;'
+        f'letter-spacing:0.06em;color:{fg};background:{bg};border:1px solid {C_BORDER};'
+        f'border-radius:999px;">{label}</span>'
+    )
+
+
+def score_card(label: str, score: int, desc: str) -> str:
+    color = score_tier_color(score)
+    return f"""<table style="width:100%;border-collapse:collapse;background:{C_CARD};border:1px solid {C_BORDER};border-radius:12px;">
+<tr>
+{cell(lit(label, C_TEXT), bg=C_CARD, weight="700")}
+{cell(lit(str(score), color), bg=C_CARD, color=color, align="right", weight="800", size="22px")}
+</tr>
+</table>
+{spacer(6)}
+<p style="padding:0 12px;font-size:12px;color:{C_MUTED};line-height:1.45;background:{C_CARD};">{lit(desc, C_MUTED)}</p>
+{spacer(8)}
+<div style="height:8px;background:{C_CELL};border-radius:6px;">
+<div style="height:8px;width:{score}%;background:{color};border-radius:6px;"></div>
 </div>
-<p style="margin:6px 0 0;font-size:13px;color:#334155;">Score out of 100: <strong>{score}</strong></p>
+{spacer(6)}
+<p style="padding:0;font-size:10px;color:{C_MUTED};letter-spacing:0.08em;background:{C_CARD};">{lit("SCORE OUT OF 100", C_MUTED)}</p>"""
+
+
+def score_cards_row(cards: list[tuple[str, int, str]]) -> str:
+    width = 100 // max(len(cards), 1)
+    tds = "".join(
+        f'<td style="width:{width}%;padding:8px;background:{C_PANEL};">{score_card(l, s, d)}</td>'
+        for l, s, d in cards
+    )
+    return f'<table style="width:100%;border-collapse:collapse;background:{C_PANEL};"><tr>{tds}</tr></table>'
+
+
+def overall_badge(overall: int) -> str:
+    color = score_tier_color(overall)
+    size = 168
+    return f"""<div style="width:{size}px;height:{size}px;border:10px solid {color};border-radius:999px;background:{C_PANEL};text-align:center;line-height:{size}px;">
+{lit(str(overall), C_TEXT)}<span style="font-size:15px;color:{C_MUTED};">/100</span>
+</div>
+{spacer(10)}
+<p style="text-align:center;font-size:12px;color:{C_MUTED};letter-spacing:0.08em;background:{C_PANEL};">{lit("OVERALL", C_MUTED)}</p>"""
+
+
+def nav_pills() -> str:
+    labels = ["Scores", "Facts", "Offers", "Search", "Improve", "Compare", "Next"]
+    cells = ""
+    for lab in labels:
+        cells += (
+            f'<td style="padding:4px 6px;background:{C_PANEL};">'
+            f'<span style="padding:6px 12px;font-size:11px;font-weight:600;color:{C_MUTED};'
+            f'background:{C_CARD};border:1px solid {C_BORDER};border-radius:999px;">'
+            f"{lit(lab, C_MUTED)}</span></td>"
+        )
+    return f'<table style="width:100%;border-collapse:collapse;background:{C_PANEL};"><tr>{cells}</tr></table>'
+
+
+def scores_section(scores: dict, overall: int) -> str:
+    channel_cards = score_cards_row(
+        [
+            (
+                "Search",
+                scores.get("search", 0),
+                "Whether Google and similar search engines can find, understand, and rank your pages for the work you sell.",
+            ),
+            (
+                "Listings",
+                scores.get("listings", 0),
+                "Whether your Google Business Profile, map pin, and name-address-phone details match and can be confirmed.",
+            ),
+            (
+                "AI answers",
+                scores.get("ai_answers", 0),
+                "Whether ChatGPT, Gemini, and other answer engines name or cite you on buyer questions in your category.",
+            ),
+        ]
+    )
+    website_cards = score_cards_row(
+        [
+            (
+                "Site health",
+                scores.get("site_health", 0),
+                "Page speed, HTTPS, crawlability, and whether important URLs load cleanly on mobile.",
+            ),
+            (
+                "Content",
+                scores.get("content", 0),
+                "Whether key pages have unique copy, accurate business facts, and proof.",
+            ),
+            (
+                "Structure",
+                scores.get("structure", 0),
+                "Sitemaps, headings, schema, and information architecture.",
+            ),
+        ]
+    )
+    return f"""<div style="background:{C_PANEL};border:1px solid {C_BORDER};border-radius:16px;padding:24px;">
+<p style="padding:0 0 14px;font-size:22px;font-weight:700;color:{C_TEXT};background:{C_PANEL};">{lit("Your scores", C_TEXT)}</p>
+<table style="width:100%;border-collapse:collapse;background:{C_PANEL};">
+<tr>
+<td style="width:200px;padding:0 20px 0 0;background:{C_PANEL};">{overall_badge(overall)}</td>
+<td style="padding:0;background:{C_PANEL};">
+<p style="padding:0 0 10px;font-size:12px;color:{C_VIOLET};letter-spacing:0.08em;background:{C_PANEL};">{lit("CHANNELS", C_VIOLET)}</p>
+{channel_cards}
+</td>
+</tr>
+</table>
+{spacer(18)}
+<p style="padding:0 0 10px;font-size:12px;color:{C_VIOLET};letter-spacing:0.08em;background:{C_PANEL};">{lit("WEBSITE", C_VIOLET)}</p>
+{website_cards}
 </div>"""
+
+
+def metric_card(label: str, value: str, status: str, note: str) -> str:
+    st_color = status_color(status)
+    return f"""<div style="padding:14px 16px;background:{C_CARD};border:1px solid {C_BORDER};border-radius:12px;">
+<p style="padding:0 0 4px;font-size:13px;color:{C_MUTED};background:{C_CARD};">{lit(label, C_MUTED)}</p>
+<p style="padding:0 0 6px;font-size:22px;font-weight:700;color:{C_TEXT};background:{C_CARD};">{lit(value, C_TEXT)}</p>
+<span style="padding:3px 10px;font-size:11px;font-weight:700;border-radius:999px;color:{C_BG};background:{st_color};">{lit(status, C_BG)}</span>
+<p style="padding:8px 0 0;font-size:12px;color:{C_BODY};line-height:1.4;background:{C_CARD};">{lit(note, C_BODY)}</p>
+</div>"""
+
+
+def search_hit_card(rank: int, query: str, score: int, note: str) -> str:
+    sc_color = score_tier_color(score) if score else C_MUTED
+    return f"""<td style="width:20%;padding:6px;background:{C_PANEL};">
+<div style="padding:12px;background:{C_CARD};border:1px solid {C_BORDER};border-radius:12px;">
+<p style="padding:0;font-size:13px;color:{C_VIOLET};background:{C_CARD};">{lit(f"{rank:02d}", C_VIOLET)}</p>
+<p style="padding:6px 0;font-size:13px;font-weight:600;color:{C_TEXT};background:{C_CARD};">{lit(query, C_TEXT)}</p>
+<p style="padding:0;font-size:20px;font-weight:700;color:{sc_color};background:{C_CARD};">{lit(str(score), sc_color)}</p>
+<p style="padding:6px 0 0;font-size:11px;color:{C_MUTED};background:{C_CARD};">{lit(note, C_MUTED)}</p>
+</div>
+</td>"""
 
 
 def build_html(client_name: str, business: str, audit: dict) -> str:
@@ -1191,176 +1805,221 @@ def build_html(client_name: str, business: str, audit: dict) -> str:
     overall = audit["overall_score"]
     scores = audit["scores"]
     prepared = TODAY.strftime("%b %d, %Y")
+    opportunity = audit.get("opportunity") or ""
+    opp_lead = opportunity.split(".")[0] + "." if opportunity else ""
+    opp_rest = opportunity[len(opp_lead) :].strip()
 
-    glance_rows = ""
-    for m in audit.get("at_a_glance") or []:
-        st = m.get("status") or "Watch"
-        glance_rows += f"""
-<div style="padding:14px 16px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;margin:0 0 10px;">
-<p style="margin:0 0 4px;font-size:13px;color:#64748B;">{esc(m.get('label'))}</p>
-<p style="margin:0 0 6px;font-size:22px;font-weight:700;color:#0F172A;">{esc(m.get('value'))}</p>
-<span style="display:inline-block;padding:3px 10px;font-size:11px;font-weight:700;border-radius:999px;color:#FFF;background:{status_color(st)};">{esc(st)}</span>
-<p style="margin:8px 0 0;font-size:12px;color:#64748B;line-height:1.4;">{esc(m.get('note'))}</p>
-</div>"""
+    glance_cards = ""
+    glance = audit.get("at_a_glance") or []
+    for i in range(0, len(glance), 2):
+        pair = glance[i : i + 2]
+        cells = ""
+        for m in pair:
+            cells += f"""<td style="width:50%;padding:8px;background:{C_BG};">
+{metric_card(m.get("label", ""), str(m.get("value", "")), m.get("status") or "Watch", m.get("note") or "")}
+</td>"""
+        if len(pair) == 1:
+            cells += f'<td style="width:50%;padding:8px;background:{C_BG};"></td>'
+        glance_cards += f'<table style="width:100%;border-collapse:collapse;background:{C_BG};"><tr>{cells}</tr></table>'
 
     facts = ""
-    for f in audit.get("other_facts") or []:
+    other_facts = audit.get("other_facts") or []
+    for i, f in enumerate(other_facts):
         st = f.get("status") or "Watch"
-        facts += f"""
-<li style="margin:0 0 10px;list-style:none;padding:12px 14px;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;">
-<strong style="color:#0F172A;">{esc(f.get('label'))}</strong>
-<span style="margin-left:8px;padding:2px 8px;font-size:11px;font-weight:700;border-radius:999px;color:#FFF;background:{status_color(st)};">{esc(st)}</span>
-<p style="margin:6px 0 0;font-size:13px;color:#475569;">{esc(f.get('detail'))}</p>
-</li>"""
+        st_c = status_color(st)
+        facts += f"""<div style="padding:12px 14px;background:{C_CARD};border:1px solid {C_BORDER};border-radius:12px;">
+<table style="width:100%;border-collapse:collapse;background:{C_CARD};"><tr>
+<td style="padding:0;background:{C_CARD};">{lit(f.get("label", ""), C_TEXT)}</td>
+<td style="padding:0;text-align:right;background:{C_CARD};"><span style="font-size:11px;font-weight:700;color:{st_c};">{lit(st.upper(), st_c)}</span></td>
+</tr></table>
+<p style="padding:8px 0 0;font-size:13px;color:{C_BODY};line-height:1.45;background:{C_CARD};">{lit(f.get("detail", ""), C_BODY)}</p>
+</div>"""
+        if i < len(other_facts) - 1:
+            facts += spacer(10)
 
     offers = ""
-    for o in audit.get("offers") or []:
+    offer_list = audit.get("offers") or []
+    for i, o in enumerate(offer_list):
         sc = o.get("score")
-        bar = f'<span style="color:#94A3B8;">{sc}</span>' if sc is not None else ""
-        offers += f"""
-<div style="margin:0 0 8px;padding:10px 12px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:8px;">
-<strong style="color:#0F172A;">{esc(o.get('name'))}</strong> {bar}
-<span style="float:right;font-size:12px;color:#64748B;">{esc(o.get('kind'))}</span>
-</div>"""
+        sc_txt = lit(str(sc), C_MUTED) if sc is not None else lit("0", C_MUTED)
+        offers += f"""<table style="width:100%;border-collapse:collapse;background:{C_CARD};border:1px solid {C_BORDER};border-radius:8px;">
+<tr>
+{cell(lit(o.get("name", ""), C_TEXT) + " " + sc_txt, bg=C_CARD)}
+{cell(lit(o.get("kind", ""), C_MUTED), bg=C_CARD, align="right", color=C_MUTED, size="12px")}
+</tr>
+</table>"""
+        if i < len(offer_list) - 1:
+            offers += spacer(8)
+
+    search_obs = audit.get("search_observations") or []
+    ranked = sorted(search_obs, key=lambda x: x.get("score") or 0, reverse=True)
+    top_hits = [o for o in ranked if (o.get("score") or 0) > 0][:5]
+    search_cards = ""
+    if top_hits:
+        for row_start in range(0, len(top_hits), 5):
+            row_items = top_hits[row_start : row_start + 5]
+            cells = ""
+            for j, o in enumerate(row_items, row_start + 1):
+                cells += search_hit_card(j, o.get("query", ""), o.get("score") or 0, o.get("note", ""))
+            search_cards += f'<table style="width:100%;border-collapse:collapse;background:{C_BG};"><tr>{cells}</tr></table>'
+            if row_start + 5 < len(top_hits):
+                search_cards += spacer(8)
 
     search_rows = ""
-    for idx, o in enumerate(audit.get("search_observations") or [], 1):
+    for idx, o in enumerate(search_obs, 1):
         sc = o.get("score") or 0
-        search_rows += f"""
-<tr>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#64748B;font-size:13px;">{idx:02d}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#0F172A;font-weight:600;">{esc(o.get('query'))}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#0F172A;font-weight:700;">{sc}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#475569;font-size:13px;">{esc(o.get('note'))}</td>
+        sc_c = score_tier_color(sc) if sc else C_MUTED
+        search_rows += f"""<tr>
+{cell(lit(f"{idx:02d}", C_VIOLET), bg=C_CELL, color=C_VIOLET, size="13px")}
+{cell(lit(o.get("query", ""), C_TEXT), bg=C_CELL, weight="600")}
+{cell(lit(str(sc), sc_c), bg=C_CELL, color=sc_c, weight="700")}
+{cell(lit(o.get("note", ""), C_BODY), bg=C_CELL, color=C_BODY, size="13px")}
 </tr>"""
 
     improve_blocks = ""
-    for imp in audit.get("improvements") or []:
+    improvements = audit.get("improvements") or []
+    for i, imp in enumerate(improvements):
         pages = "".join(
-            f'<li style="margin:0 0 4px;"><a href="{esc(p)}" style="color:#2563EB;">{esc(p)}</a></li>'
+            f'<p style="padding:0 0 4px;font-size:13px;background:{C_CARD};"><a href="{esc(p)}" style="color:{C_LINK};">{lit(p, C_LINK)}</a></p>'
             for p in imp.get("pages") or []
         )
-        improve_blocks += f"""
-<div style="margin:0 0 14px;padding:16px 18px;background:#FFFFFF;border:1px solid #E2E8F0;border-left:4px solid #2563EB;border-radius:8px;">
-<p style="margin:0 0 4px;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#2563EB;">{esc(imp.get('category'))} · {esc(imp.get('priority'))}</p>
-<h3 style="margin:0 0 8px;font-size:16px;color:#0F172A;">{esc(imp.get('title'))}</h3>
-<p style="margin:0 0 10px;font-size:14px;color:#475569;line-height:1.5;">{esc(imp.get('finding'))}</p>
-<p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#0F172A;text-transform:uppercase;letter-spacing:0.04em;">What we recommend</p>
-<p style="margin:0 0 10px;font-size:14px;color:#334155;line-height:1.5;">{esc(imp.get('recommendation'))}</p>
-<ul style="margin:0;padding-left:18px;font-size:13px;">{pages}</ul>
-</div>"""
+        improve_blocks += f"""<table style="width:100%;border-collapse:collapse;background:{C_CARD};border:1px solid {C_BORDER};border-radius:12px;">
+<tr>
+<td style="width:4px;padding:0;background:{C_LINK};"></td>
+<td style="padding:16px 18px;background:{C_CARD};">
+<p style="padding:0 0 8px;background:{C_CARD};">{priority_badge(imp.get("priority", ""))}</p>
+<p style="padding:0 0 4px;font-size:11px;font-weight:700;letter-spacing:0.06em;color:{C_VIOLET};background:{C_CARD};">{lit(f"{imp.get('category', '').upper()} · {imp.get('priority', '').upper()}", C_VIOLET)}</p>
+<p style="padding:0 0 8px;font-size:16px;font-weight:600;color:{C_TEXT};background:{C_CARD};">{lit(imp.get("title", ""), C_TEXT)}</p>
+<p style="padding:0 0 10px;font-size:14px;color:{C_BODY};line-height:1.5;background:{C_CARD};">{lit(imp.get("finding", ""), C_BODY)}</p>
+<p style="padding:0 0 6px;font-size:12px;font-weight:700;color:{C_TEXT};letter-spacing:0.04em;background:{C_CARD};">{lit("WHAT WE RECOMMEND", C_TEXT)}</p>
+<p style="padding:0 0 10px;font-size:14px;color:{C_BODY};line-height:1.5;background:{C_CARD};">{lit(imp.get("recommendation", ""), C_BODY)}</p>
+{pages}
+</td>
+</tr>
+</table>"""
+        if i < len(improvements) - 1:
+            improve_blocks += spacer(14)
 
     comp_rows = ""
     for idx, c in enumerate(audit.get("competitors") or [], 1):
         link = c.get("link") or (f"https://{c['site']}" if c.get("site") else "")
         name_cell = (
-            f'<a href="{esc(link)}" style="color:#2563EB;">{esc(c.get("name"))}</a>'
+            f'<a href="{esc(link)}" style="color:{C_LINK};">{lit(c.get("name", ""), C_LINK)}</a>'
             if link
-            else esc(c.get("name"))
+            else lit(c.get("name", ""), C_TEXT)
         )
-        comp_rows += f"""
-<tr>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;">{idx:02d}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;">{name_cell}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#475569;">{esc(c.get('site'))}</td>
-<td style="padding:10px 12px;border-bottom:1px solid #E2E8F0;color:#64748B;font-size:13px;">{esc(c.get('notes'))}</td>
+        comp_rows += f"""<tr>
+{cell(lit(f"{idx:02d}", C_VIOLET), bg=C_CELL, color=C_VIOLET)}
+{cell(name_cell, bg=C_CELL, weight="600")}
+{cell(lit(c.get("site", ""), C_BODY), bg=C_CELL, color=C_BODY)}
+{cell(lit(c.get("notes", ""), C_MUTED), bg=C_CELL, color=C_MUTED, size="13px")}
 </tr>"""
 
     steps = ""
-    for s in audit.get("next_steps") or []:
-        steps += f"""
-<div style="display:flex;gap:14px;margin:0 0 12px;padding:14px 16px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;">
-<div style="min-width:36px;font-size:18px;font-weight:700;color:#94A3B8;">{s.get('rank', 0):02d}</div>
-<div>
-<p style="margin:0 0 4px;font-size:11px;font-weight:700;color:#2563EB;">{esc(s.get('badge'))} · {esc(s.get('effort'))}</p>
-<h3 style="margin:0 0 6px;font-size:15px;color:#0F172A;">{esc(s.get('title'))}</h3>
-<p style="margin:0;font-size:13px;color:#475569;line-height:1.45;">{esc(s.get('detail'))}</p>
-</div>
-</div>"""
+    next_steps = audit.get("next_steps") or []
+    for i, s in enumerate(next_steps):
+        steps += f"""<table style="width:100%;border-collapse:collapse;background:{C_CARD};border:1px solid {C_BORDER};border-radius:12px;">
+<tr>
+{cell(lit(f"{s.get('rank', 0):02d}", C_MUTED), bg=C_CARD, color=C_MUTED, weight="700", size="18px")}
+<td style="padding:14px 16px;background:{C_CARD};">
+<p style="padding:0 0 4px;font-size:11px;font-weight:700;color:{C_LINK};background:{C_CARD};">{lit(f"{s.get('badge', '')} · {s.get('effort', '')}", C_LINK)}</p>
+<p style="padding:0 0 6px;font-size:15px;font-weight:600;color:{C_TEXT};background:{C_CARD};">{lit(s.get("title", ""), C_TEXT)}</p>
+<p style="padding:0;font-size:13px;color:{C_BODY};line-height:1.45;background:{C_CARD};">{lit(s.get("detail", ""), C_BODY)}</p>
+</td>
+</tr>
+</table>"""
+        if i < len(next_steps) - 1:
+            steps += spacer(12)
 
     unreachable = ""
     if not audit.get("reachable"):
-        unreachable = f"""
-<p style="margin:0 0 16px;padding:12px 14px;background:#FEE2E2;color:#991B1B;border:1px solid #FECACA;border-radius:8px;">
-<strong>Site unreachable.</strong> Could not fully load {esc(site)}. Scores reflect partial data.</p>"""
+        unreachable = f"""<div style="padding:12px 14px;background:#7F1D1D;border:1px solid #991B1B;border-radius:8px;">
+{lit(f"Site unreachable. Could not fully load {site}. Scores reflect partial data.", "#FCA5A5")}
+</div>{spacer(16)}"""
 
-    section = "margin:0 0 28px;padding:0 28px;"
-    h2 = "margin:0 0 14px;font-size:18px;font-weight:700;color:#0F172A;"
+    h2 = f"padding:0 0 14px;font-size:18px;font-weight:700;color:{C_TEXT};background:{C_BG};"
+    sub = f"padding:0 0 12px;font-size:13px;color:{C_MUTED};background:{C_BG};"
+    wrap = f"padding:0 28px;background:{C_BG};"
 
-    return f"""<div style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0F172A;background:#F1F5F9;line-height:1.5;">
-<header style="background:linear-gradient(135deg,#0F172A 0%,#1E3A5F 100%);color:#FFFFFF;padding:32px 28px 28px;">
-<p style="margin:0 0 6px;font-size:12px;letter-spacing:0.1em;text-transform:uppercase;color:#93C5FD;">Private AI and search snapshot · Connection Inc</p>
-<h1 style="margin:0 0 10px;font-size:28px;line-height:1.2;color:#FFFFFF;">How visible is {esc(brand)}?</h1>
-<p style="margin:0 0 16px;font-size:15px;color:#CBD5E1;max-width:720px;line-height:1.55;">{esc(audit.get('opportunity'))}</p>
-<p style="margin:0;font-size:13px;color:#94A3B8;">Prepared on {esc(prepared)} · Website <a href="{esc(site)}" style="color:#93C5FD;">{esc(host)}</a></p>
-</header>
+    return f"""<div style="padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:{C_TEXT};background:{C_BG};line-height:1.5;">
+<div style="background:{C_PANEL};color:{C_TEXT};padding:32px 28px 28px;">
+<p style="padding:0 0 6px;font-size:10px;letter-spacing:0.22em;color:{C_VIOLET};background:{C_PANEL};">{lit("AI AND SEARCH SNAPSHOT", C_VIOLET)}</p>
+<h1 style="padding:0 0 10px;font-size:28px;line-height:1.2;color:{C_TEXT};background:{C_PANEL};">{lit("How visible is ", C_TEXT)}{lit(brand, C_VIOLET)}?</h1>
+<p style="padding:0 0 16px;font-size:15px;color:{C_BODY};line-height:1.55;background:{C_PANEL};"><strong style="color:{C_TEXT};">{lit(opp_lead, C_TEXT)}</strong> {lit(opp_rest, C_BODY)}</p>
+<p style="padding:0;font-size:13px;color:{C_MUTED};background:{C_PANEL};">{lit("Prepared on ", C_MUTED)}{lit(prepared, C_TEXT)}{lit(" · Website ", C_MUTED)}<a href="{esc(site)}" style="color:{C_LINK};">{lit(host, C_LINK)}</a></p>
+</div>
+<div style="height:4px;background:{C_LINK};"></div>
+{spacer(16)}
+<div style="{wrap}">{nav_pills()}</div>
+{spacer(24)}
+<div style="{wrap}">
 {unreachable}
-<section style="{section}padding-top:24px;">
-<h2 style="{h2}">Scores</h2>
-<div style="display:flex;flex-wrap:wrap;gap:16px;margin:0 0 20px;">
-<div style="flex:1;min-width:140px;padding:20px;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;text-align:center;">
-<p style="margin:0;font-size:36px;font-weight:800;color:#0F172A;">{overall}<span style="font-size:16px;color:#64748B;">/100</span></p>
-<p style="margin:4px 0 0;font-size:13px;color:#64748B;">Overall</p>
+<h2 style="{h2}">{lit("Scores", C_TEXT)}</h2>
+<p style="{sub}">{lit("Channels are how people discover you. Site scores are how ready the website is when they arrive. Empty bars were not measured in this snapshot.", C_MUTED)}</p>
+{scores_section(scores, overall)}
 </div>
+{spacer(28)}
+<div style="{wrap}">
+<h2 style="{h2}">{lit("Facts · At a glance", C_TEXT)}</h2>
+<p style="{sub}">{lit("Measured numbers get a chart. Plain facts stay in the list below.", C_MUTED)}</p>
+{glance_cards}
+{spacer(16)}
+<h3 style="padding:0 0 10px;font-size:14px;font-weight:700;color:{C_VIOLET};background:{C_BG};">{lit("Other facts", C_VIOLET)}</h3>
+{facts}
 </div>
-<h3 style="margin:0 0 10px;font-size:14px;font-weight:700;color:#64748B;text-transform:uppercase;letter-spacing:0.05em;">Channels</h3>
-{score_bar("Search", scores.get("search", 0), "Whether search engines can find and rank your pages for the work you sell.")}
-{score_bar("Listings", scores.get("listings", 0), "Google Business Profile, map pin, and name-address-phone consistency.")}
-{score_bar("AI answers", scores.get("ai_answers", 0), "Whether Gemini names or cites you on buyer questions in your category.")}
-<h3 style="margin:16px 0 10px;font-size:14px;font-weight:700;color:#64748B;text-transform:uppercase;letter-spacing:0.05em;">Website</h3>
-{score_bar("Site health", scores.get("site_health", 0), "Page speed, HTTPS, and whether key URLs load cleanly on mobile.")}
-{score_bar("Content", scores.get("content", 0), "Unique copy, meta tags, headings, and proof on key pages.")}
-{score_bar("Structure", scores.get("structure", 0), "Sitemaps, canonicals, schema, and information architecture.")}
-</section>
-<section style="{section}">
-<h2 style="{h2}">Facts · At a glance</h2>
-{glance_rows}
-<h3 style="margin:16px 0 10px;font-size:14px;font-weight:700;color:#64748B;">Other facts</h3>
-<ul style="margin:0;padding:0;">{facts}</ul>
-</section>
-<section style="{section}">
-<h2 style="{h2}">Offers · What you offer</h2>
-<p style="margin:0 0 12px;font-size:13px;color:#64748B;">Services and products found on the live site.</p>
-{offers or '<p style="color:#64748B;">No service headings detected on the homepage.</p>'}
-</section>
-<section style="{section}">
-<h2 style="{h2}">Search · Where you show up</h2>
-<p style="margin:0 0 12px;font-size:13px;color:#64748B;">Search observations from this snapshot — sample ranks, not Search Console history.</p>
-<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;overflow:hidden;font-size:14px;">
-<thead><tr style="background:#F8FAFC;">
-<th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">#</th>
-<th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Query</th>
-<th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Score</th>
-<th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Note</th>
+{spacer(28)}
+<div style="{wrap}">
+<h2 style="{h2}">{lit("Offers · What you offer", C_TEXT)}</h2>
+<p style="{sub}">{lit("Services and products found on the live site. Bars appear only when a visibility score was measured.", C_MUTED)}</p>
+{offers or f"<p style=\"color:{C_MUTED};background:{C_BG};\">{lit('No service headings detected on the homepage.', C_MUTED)}</p>"}
+</div>
+{spacer(28)}
+<div style="{wrap}">
+<h2 style="{h2}">{lit("Search · Where you show up", C_TEXT)}</h2>
+<p style="{sub}">{lit("Search observations from this snapshot — not estimated ranks unless a rank was actually recorded.", C_MUTED)}</p>
+{search_cards}
+{spacer(12) if search_cards else ""}
+<p style="padding:0 0 10px;font-size:14px;font-weight:700;color:{C_VIOLET};background:{C_BG};">{lit("Search observations", C_VIOLET)}</p>
+<table style="width:100%;border-collapse:collapse;background:{C_CELL};border:1px solid {C_BORDER};border-radius:10px;font-size:14px;">
+<thead><tr>
+{cell(lit("#", C_VIOLET), header=True, bg=C_CELL, color=C_VIOLET, size="12px")}
+{cell(lit("Query", C_VIOLET), header=True, bg=C_CELL, color=C_VIOLET, size="12px")}
+{cell(lit("Score", C_VIOLET), header=True, bg=C_CELL, color=C_VIOLET, size="12px")}
+{cell(lit("Note", C_VIOLET), header=True, bg=C_CELL, color=C_VIOLET, size="12px")}
 </tr></thead>
 <tbody>{search_rows}</tbody>
 </table>
-</section>
-<section style="{section}">
-<h2 style="{h2}">Improve · What to improve</h2>
-{improve_blocks or '<p style="color:#64748B;">No critical improvements flagged this week.</p>'}
-</section>
-<section style="{section}">
-<h2 style="{h2}">Compare · How you compare</h2>
-<p style="margin:0 0 12px;font-size:13px;color:#64748B;">Firms observed in the same sampled searches and AI answers.</p>
-<table style="width:100%;border-collapse:collapse;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;overflow:hidden;font-size:14px;">
-<thead><tr style="background:#F8FAFC;">
-<th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">#</th>
-<th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Company</th>
-<th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Site</th>
-<th style="padding:10px 12px;text-align:left;color:#64748B;font-size:12px;">Notes</th>
+</div>
+{spacer(28)}
+<div style="{wrap}">
+<h2 style="{h2}">{lit("Improve · What to improve", C_TEXT)}</h2>
+<p style="{sub}">{lit("Open a row for the finding, the recommendation, and the pages it touches.", C_MUTED)}</p>
+{improve_blocks or f"<p style=\"color:{C_MUTED};background:{C_BG};\">{lit('No critical improvements flagged this week.', C_MUTED)}</p>"}
+</div>
+{spacer(28)}
+<div style="{wrap}">
+<h2 style="{h2}">{lit("Compare · How you compare", C_TEXT)}</h2>
+<p style="{sub}">{lit("Firms that showed up in the same sampled searches and AI answers. Scores appear only when we measured them.", C_MUTED)}</p>
+<table style="width:100%;border-collapse:collapse;background:{C_CELL};border:1px solid {C_BORDER};border-radius:10px;font-size:14px;">
+<thead><tr>
+{cell(lit("#", C_VIOLET), header=True, bg=C_CELL, color=C_VIOLET, size="12px")}
+{cell(lit("Company", C_VIOLET), header=True, bg=C_CELL, color=C_VIOLET, size="12px")}
+{cell(lit("Site", C_VIOLET), header=True, bg=C_CELL, color=C_VIOLET, size="12px")}
+{cell(lit("Notes", C_VIOLET), header=True, bg=C_CELL, color=C_VIOLET, size="12px")}
 </tr></thead>
-<tbody>{comp_rows or '<tr><td colspan="4" style="padding:12px;color:#64748B;">No competitors observed in this sample.</td></tr>'}</tbody>
+<tbody>{comp_rows or f"<tr>{cell(lit('No competitors observed in this sample.', C_MUTED), bg=C_CELL)}</tr>"}</tbody>
 </table>
-</section>
-<section style="{section}padding-bottom:32px;">
-<h2 style="{h2}">Next · Your next steps</h2>
-<p style="margin:0 0 14px;font-size:13px;color:#64748B;">Work from the top for the fastest lift.</p>
+</div>
+{spacer(28)}
+<div style="{wrap}">
+<h2 style="{h2}">{lit("Next · Your next steps", C_TEXT)}</h2>
+<p style="{sub}">{lit("Work from the top if you want the fastest lift.", C_MUTED)}</p>
 {steps}
-</section>
-<footer style="padding:16px 28px 28px;border-top:1px solid #E2E8F0;background:#FFFFFF;">
-<p style="margin:0;font-size:12px;color:#64748B;line-height:1.5;">Private AI and search snapshot for {esc(client_name)}. Generated {esc(REPORT_DATE)} by Connection Inc weekly automation. Search observations use Gemini with Google Search grounding — sample-based, not guaranteed Google positions. Connect Search Console and Analytics for historical data.</p>
-</footer>
+</div>
+{spacer(20)}
+<div style="border:1px solid {C_BORDER};background:{C_PANEL};padding:16px 28px;">
+<p style="padding:0;font-size:12px;color:{C_MUTED};line-height:1.5;background:{C_PANEL};">{lit(f"Private AI and search snapshot for {client_name}. Generated {REPORT_DATE} by Connection Inc weekly automation. Search observations use Gemini with Google Search grounding — sample-based, not guaranteed Google positions. Connect Search Console and Analytics for historical data.", C_MUTED)}</p>
+</div>
 </div>"""
 
 
@@ -1477,8 +2136,20 @@ def main() -> int:
             continue
         site = normalize_site_url(site)
         business = client.get("businessName") or name
-        print(json.dumps({"event": "audit_start", "client": name, "site": site}))
-        audit = audit_visibility(site, business)
+        ga_prop = ga_property_from_client(client)
+        gsc_site = gsc_site_from_client(client)
+        print(
+            json.dumps(
+                {
+                    "event": "audit_start",
+                    "client": name,
+                    "site": site,
+                    "gaPropertyConfigured": bool(ga_prop),
+                    "gscSiteOverride": bool(gsc_site),
+                }
+            )
+        )
+        audit = audit_visibility(site, business, ga_property=ga_prop, gsc_site=gsc_site)
         print(
             json.dumps(
                 {
