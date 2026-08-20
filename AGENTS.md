@@ -38,26 +38,24 @@ Automation prompt: [AUTOMATION_PROMPT.md](./AUTOMATION_PROMPT.md)
 | `gemini_api` | Gemini + Google Search grounding |
 | `places_api` | Places API (Google Business Profile) |
 | `geocoding_api` | Geocoding API |
-| `search_console_api` | Search Console API (OAuth / service account JSON) |
-| `analytics_data_api` | Google Analytics Data API (OAuth / service account JSON) |
-| `analytics_property_id` | GA4 property ID (`123456789` or `properties/123456789`) |
+| `search_console_api` | Search Console API (service account JSON) |
+| `analytics_data_api` | Google Analytics Data API (service account JSON) |
 | `custom_search_api` | Not used (full-web CSE unavailable for new engines) |
 | `maps_javascript_api` | Not used (browser-only) |
 
-Optional: `GEMINI_MODEL` (default `gemini-3.6-flash`).
+Optional: `GEMINI_MODEL` (default `gemini-3.6-flash`). Optional global fallback: `analytics_property_id` (prefer per-client portal fields).
 
 ### Per-client overrides (portal custom fields)
 
 | Custom field name | Example | Purpose |
 |---|---|---|
 | `Services` | `FHA loans, Refinance, VA loans` | Preferred Offers + search queries |
-| `GA4 Property ID` | `365023674` | Client’s GA4 property |
-| `Search Console Site URL` | `sc-domain:adamzmortgage.com` | Exact GSC property URL |
+| `GA4 URL` / `GA4 Property ID` | analytics admin URL or `458571033` | Client’s GA4 property |
+| `GSC URL` / `Search Console Site URL` | GSC users URL or `sc-domain:example.com` | Exact GSC property |
 
 ### Search Console + Analytics credentials
 
-Unlike PageSpeed, **Search Console and GA4 Data APIs require OAuth**, not a plain API key. Store **service account JSON** in `search_console_api` / `analytics_data_api`, grant that email access on each property, and set `analytics_property_id` (or the client custom field).
-
+Unlike PageSpeed, **Search Console and GA4 Data APIs require OAuth**, not a plain API key. Store **service account JSON** in `search_console_api` / `analytics_data_api`, and invite that JSON’s `client_email` on each client’s GSC + GA. Property IDs come from the portal client fields (no global `analytics_property_id` required).
 ## Data sources
 
 | Section | Source |
@@ -71,14 +69,18 @@ Unlike PageSpeed, **Search Console and GA4 Data APIs require OAuth**, not a plai
 
 ## Pilot clients
 
-Configured in `visibility_report/config.py`:
+Configured in `visibility_report/config.py`. Current pilot: **Amy DeBusk** (`amydebuskhomeloans.com`), resolved by website host at runtime.
 
-```python
-PILOTS = [
-    ("Adam Zeman", "cmkoitqae0001ib04j8hrefa9"),
-]
-```
+### GSC / GA access (important)
 
+The weekly job authenticates with the **service account email inside** your `search_console_api` / `analytics_data_api` JSON (`client_email`, usually `…@….iam.gserviceaccount.com`).
+
+Adding `ai.seo@connectionincorporated.com` in the Google UI only helps if that address is the same as `client_email` in the JSON. If the JSON is a GCP service account, invite **that** `client_email` (not the human Workspace inbox) as:
+
+- Search Console → Users → Restricted or Full
+- GA4 → Account (or Property) access → Viewer
+
+The run summary prints `service_account_email` in `apiNotes` so you know exactly which address to invite.
 ## Template reference
 
 [Oasbit visibility report](https://oasbit.com/114/4757a659-1a96-4425-947d-4ffae49f87c2)

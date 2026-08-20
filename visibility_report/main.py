@@ -9,6 +9,7 @@ from .audit import audit_visibility
 from .config import PILOTS
 from .portal import (
     api_get,
+    find_client_by_website_host,
     ga_property_from_client,
     gsc_site_from_client,
     normalize_site_url,
@@ -16,25 +17,60 @@ from .portal import (
 )
 from .publish import publish
 
-def main() -> int:
-    summaries = []
-    for _label, cid in PILOTS:
+
+def resolve_pilot(pilot: dict | tuple) -> tuple[str, dict | None, str | None]:
+    """Return (label, client_or_none, skip_reason)."""
+    if isinstance(pilot, tuple):
+        label, cid = pilot
         status, client = api_get(f"/clients/{cid}")
         if status != 200 or not isinstance(client, dict):
+            return label, None, f"GET /clients/{{id}} HTTP {status}"
+        return label, client, None
+
+    label = pilot.get("name") or "pilot"
+    cid = pilot.get("client_id")
+    host = (pilot.get("website_host") or "").strip().lower().removeprefix("www.")
+
+    if cid:
+        status, client = api_get(f"/clients/{cid}")
+        if status != 200 or not isinstance(client, dict):
+            return label, None, f"GET /clients/{{id}} HTTP {status}"
+        return label, client, None
+
+    if host:
+        client = find_client_by_website_host(host)
+        if not client:
+            return label, None, f"no portal client with Website URL host {host}"
+        return label, client, None
+
+    return label, None, "pilot missing client_id and website_host"
+
+
+def main() -> int:
+    summaries = []
+    for pilot in PILOTS:
+        label, client, skip_reason = resolve_pilot(pilot)
+        if skip_reason or not client:
             summaries.append(
                 {
-                    "client": _label,
-                    "clientId": cid,
+                    "client": label,
+                    "clientId": (pilot.get("client_id") if isinstance(pilot, dict) else pilot[1])
+                    if isinstance(pilot, (dict, tuple))
+                    else None,
                     "skipped": True,
-                    "reason": f"GET /clients/{{id}} HTTP {status}",
+                    "reason": skip_reason or "client not found",
                     "reportId": None,
                 }
             )
             print(json.dumps(summaries[-1]))
             continue
-        name = client.get("name") or _label
+
+        cid = client.get("id")
+        name = client.get("name") or label
         if client.get("archivedAt"):
-            summaries.append({"client": name, "clientId": cid, "skipped": True, "reason": "archived", "reportId": None})
+            summaries.append(
+                {"client": name, "clientId": cid, "skipped": True, "reason": "archived", "reportId": None}
+            )
             print(json.dumps(summaries[-1]))
             continue
         site = website_url_from_client(client)
@@ -59,9 +95,12 @@ def main() -> int:
                 {
                     "event": "audit_start",
                     "client": name,
+                    "clientId": cid,
                     "site": site,
                     "gaPropertyConfigured": bool(ga_prop),
+                    "gaProperty": ga_prop or None,
                     "gscSiteOverride": bool(gsc_site),
+                    "gscSite": gsc_site or None,
                 }
             )
         )

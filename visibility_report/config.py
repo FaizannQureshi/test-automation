@@ -14,7 +14,12 @@ TODAY = date.today()
 REPORT_DATE = TODAY.isoformat()
 WEEK_OF = (TODAY - timedelta(days=TODAY.weekday())).isoformat()
 
-# Single active pilot while the new visibility template is verified in Admin → Reports.
+# Active pilot(s). Prefer portal client id when known; otherwise set website_host
+# and main.py will resolve the client by matching Credentials → Website URL.
 PILOTS = [
-    ("Adam Zeman", "cmkoitqae0001ib04j8hrefa9"),
+    {
+        "name": "Amy DeBusk",
+        "client_id": None,  # resolved at runtime by website_host
+        "website_host": "amydebuskhomeloans.com",
+    },
 ]

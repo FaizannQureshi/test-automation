@@ -69,34 +69,116 @@ def custom_field_value(client: dict, *names: str) -> str | None:
     return None
 
 
+def parse_ga4_property_id(raw: str) -> str:
+    """Extract GA4 property id from a bare id or analytics.google.com admin/report URL."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        return f"properties/{raw}"
+    if raw.startswith("properties/"):
+        return raw
+    # https://analytics.google.com/...#/aACCOUNT_IDpPROPERTY_ID/...
+    # Note: account+property are concatenated (a123p456) so \bp…\b does not match.
+    m = (
+        re.search(r"a\d+p(\d{6,})", raw)
+        or re.search(r"[?/#&]p(\d{6,})", raw)
+        or re.search(r"/p(\d{6,})", raw)
+        or re.search(r"(?<![a-zA-Z0-9])p(\d{6,})", raw)
+    )
+    if m:
+        return f"properties/{m.group(1)}"
+    m2 = re.search(r"properties%2F(\d+)", raw) or re.search(r"properties/(\d+)", raw)
+    if m2:
+        return f"properties/{m2.group(1)}"
+    digits = re.fullmatch(r"\d{6,}", raw)
+    if digits:
+        return f"properties/{raw}"
+    return ""
+
+
+def parse_gsc_site_url(raw: str) -> str:
+    """Extract Search Console property URL from a GSC console link or bare site URL."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    # resource_id=https%3A%2F%2Fexample.com%2F  or  resource_id=sc-domain%3Aexample.com
+    m = re.search(r"resource_id=([^&]+)", raw)
+    if m:
+        from urllib.parse import unquote
+
+        return unquote(m.group(1)).strip()
+    if "search-console" in raw and "://" in raw:
+        # fallback: last path-looking host
+        host_m = re.search(r"(?:sc-domain:)?([a-z0-9.-]+\.[a-z]{2,})", raw, re.I)
+        if host_m and "google.com" not in host_m.group(1).lower():
+            val = host_m.group(0)
+            return val if val.startswith("sc-domain:") or val.startswith("http") else f"sc-domain:{host_m.group(1)}"
+    return raw
+
+
 def ga_property_from_client(client: dict) -> str:
     raw = custom_field_value(
         client,
         "GA4 Property ID",
         "Analytics Property ID",
         "Google Analytics Property ID",
+        "GA4 URL",
+        "Google Analytics URL",
+        "Analytics URL",
         "analytics property id",
         "ga4 property id",
+        "ga4 url",
     )
-    if not raw:
-        return analytics_property_id()
-    raw = raw.strip()
-    if raw.isdigit():
-        return f"properties/{raw}"
-    if not raw.startswith("properties/"):
-        return f"properties/{raw}"
-    return raw
+    if raw:
+        parsed = parse_ga4_property_id(raw)
+        if parsed:
+            return parsed
+    return analytics_property_id()
 
 
 def gsc_site_from_client(client: dict) -> str | None:
-    return custom_field_value(
+    raw = custom_field_value(
         client,
         "Search Console Site URL",
         "Search Console Property",
         "GSC Site URL",
+        "GSC URL",
+        "Search Console URL",
         "search console site url",
         "gsc property",
+        "gsc url",
     )
+    if not raw:
+        return None
+    return parse_gsc_site_url(raw) or None
+
+
+def list_clients() -> list[dict]:
+    """Fetch portal clients (handles list or paginated dict responses)."""
+    status, body = api_get("/clients")
+    if status != 200:
+        return []
+    if isinstance(body, list):
+        return [c for c in body if isinstance(c, dict)]
+    if isinstance(body, dict):
+        for key in ("clients", "data", "items", "results"):
+            val = body.get(key)
+            if isinstance(val, list):
+                return [c for c in val if isinstance(c, dict)]
+    return []
+
+
+def find_client_by_website_host(host: str) -> dict | None:
+    """Match a portal client whose Credentials → Website URL host matches."""
+    want = host.lower().removeprefix("www.")
+    for client in list_clients():
+        site = website_url_from_client(client)
+        if not site:
+            continue
+        if site_host(site) == want:
+            return client
+    return None
 
 
 def normalize_gsc_site(raw: str) -> str:

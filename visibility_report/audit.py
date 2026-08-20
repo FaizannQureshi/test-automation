@@ -17,7 +17,7 @@ from .crawl import (
     session,
     sitemap_urls_from_robots,
 )
-from .env import ga_configured, gemini_key, google_key, gsc_configured
+from .env import ga_configured, gemini_key, google_key, gsc_configured, gsc_secret, ga_secret, service_account_email_from_secret
 from .google_apis import (
     brand_mentioned,
     fetch_analytics,
@@ -458,7 +458,7 @@ def audit_visibility(
                 ),
             }
         )
-    elif ga_configured():
+    elif ga_configured(ga_property):
         other_facts.append(
             {
                 "label": "Google Analytics",
@@ -637,10 +637,15 @@ def audit_visibility(
         "api_notes": {
             "gsc": gsc_configured(),
             "gsc_ok": bool(gsc_data.get("ok")),
-            "gsc_error": (gsc_data.get("error") or "")[:120] if not gsc_data.get("ok") else "",
-            "ga": ga_configured(),
+            "gsc_error": (gsc_data.get("error") or "")[:160] if not gsc_data.get("ok") else "",
+            "ga": ga_configured(ga_property),
             "ga_ok": bool(ga_data.get("ok")),
-            "ga_error": (ga_data.get("error") or "")[:120] if not ga_data.get("ok") else "",
+            "ga_error": (ga_data.get("error") or "")[:160] if not ga_data.get("ok") else "",
+            "ga_property": ga_property or "",
+            "service_account_email": (
+                service_account_email_from_secret(gsc_secret())
+                or service_account_email_from_secret(ga_secret())
+            ),
             "pagespeed": bool(google_key("PAGESPEED")),
             "gemini": bool(gemini_key()),
             "places": bool(google_key("PLACES")),

@@ -63,6 +63,20 @@ def ga_secret() -> str:
     )
 
 
+def service_account_email_from_secret(secret: str) -> str:
+    """Return client_email from a service-account JSON secret (safe to log)."""
+    secret = (secret or "").strip()
+    if not secret.startswith("{"):
+        return ""
+    try:
+        import json
+
+        info = json.loads(secret)
+        return (info.get("client_email") or "").strip()
+    except Exception:
+        return ""
+
+
 def analytics_property_id() -> str:
     raw = env(
         "analytics_property_id",
@@ -83,5 +97,6 @@ def gsc_configured() -> bool:
     return bool(gsc_secret())
 
 
-def ga_configured() -> bool:
-    return bool(ga_secret()) and bool(analytics_property_id())
+def ga_configured(property_id: str | None = None) -> bool:
+    prop = (property_id or "").strip() or analytics_property_id()
+    return bool(ga_secret()) and bool(prop)
