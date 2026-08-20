@@ -165,6 +165,62 @@ def gemini_search_ranking(query: str, brand: str, host: str) -> dict:
     }
 
 
+def _significant_name_tokens(text: str) -> list[str]:
+    stop = {
+        "the", "and", "or", "of", "for", "a", "an", "llc", "inc", "co", "corp",
+        "group", "team", "home", "loans", "loan", "mortgage", "mortgages",
+        "capital", "bay", "real", "estate",
+    }
+    tokens = re.findall(r"[a-z0-9]{3,}", (text or "").lower())
+    return [t for t in tokens if t not in stop]
+
+
+def _places_name_compatible(place_name: str, want_name: str) -> bool:
+    """True when place display name is a plausible match for the client brand."""
+    place = (place_name or "").lower().strip()
+    want = (want_name or "").lower().strip()
+    if not place or not want:
+        return False
+    if want in place or place in want:
+        return True
+    want_toks = _significant_name_tokens(want)
+    place_toks = set(_significant_name_tokens(place))
+    if not want_toks:
+        return False
+    # Require most distinctive tokens (avoids Chris → Christian preschool)
+    hits = sum(1 for t in want_toks if t in place_toks)
+    if len(want_toks) == 1:
+        return hits == 1 and want_toks[0] in place.split()
+    return hits >= max(2, (len(want_toks) + 1) // 2)
+
+
+def _places_types_suspicious(types: list | None) -> bool:
+    """Reject categories that are clearly not a professional services listing."""
+    bad = {
+        "preschool",
+        "primary_school",
+        "secondary_school",
+        "school",
+        "university",
+        "church",
+        "place_of_worship",
+        "cemetery",
+        "restaurant",
+        "cafe",
+        "bar",
+        "night_club",
+        "lodging",
+        "hotel",
+        "hospital",
+        "dentist",
+        "veterinary_care",
+    }
+    for t in types or []:
+        if str(t).lower() in bad:
+            return True
+    return False
+
+
 def places_lookup(
     business_name: str,
     website: str,
@@ -175,7 +231,6 @@ def places_lookup(
 ) -> dict:
     key = google_key("PLACES")
     if not key:
-        # Portal GBP still lets us show a partial listings fact
         if gbp_name or gbp_url:
             return {
                 "ok": True,
@@ -197,10 +252,12 @@ def places_lookup(
     queries: list[str] = []
     if name and city:
         queries.append(f"{name} {city}")
+    if name and host:
+        queries.append(f"{name} {host}")
     if name:
-        queries.append(f"{name} mortgage lender")
         queries.append(name)
     if business_name and business_name.strip().lower() != name.lower():
+        queries.append(f"{business_name.strip()} {city or ''}".strip())
         queries.append(business_name.strip())
     if city:
         queries.append(f"{host} {city}")
@@ -208,12 +265,11 @@ def places_lookup(
     seen_q: set[str] = set()
     query_list = []
     for q in queries:
-        k = q.lower()
-        if k not in seen_q:
+        k = q.lower().strip()
+        if k and k not in seen_q:
             seen_q.add(k)
-            query_list.append(q)
+            query_list.append(q.strip())
 
-    # Bias search near Primary City when Geocoding works
     location_bias = None
     if city:
         geo = geocode_address(city)
@@ -230,10 +286,50 @@ def places_lookup(
         "places.userRatingCount,places.websiteUri,places.nationalPhoneNumber,"
         "places.types,places.googleMapsUri"
     )
+
+    def _portal_partial(err: str) -> dict:
+        return {
+            "ok": True,
+            "partial": True,
+            "source": "portal_gbp",
+            "name": name,
+            "address": (city or "").strip(),
+            "rating": None,
+            "review_count": None,
+            "phone": "",
+            "website": website,
+            "maps_uri": gbp_url or "",
+            "types": [],
+            "error": err,
+        }
+
+    def _score_place(p: dict) -> int:
+        score = 0
+        uri = (p.get("websiteUri") or "").lower()
+        disp = ((p.get("displayName") or {}).get("text") or "")
+        types = p.get("types") or []
+        if _places_types_suspicious(types):
+            return -100
+        if host and host in uri:
+            score += 100
+        elif uri:
+            # Has a website but not ours — weak unless name is excellent
+            score -= 20
+        if _places_name_compatible(disp, name):
+            score += 40
+        elif _places_name_compatible(disp, business_name or ""):
+            score += 30
+        else:
+            score -= 40
+        if p.get("rating"):
+            score += 5
+        if p.get("userRatingCount"):
+            score += 5
+        return score
+
     try:
-        match = None
+        candidates: list[dict] = []
         last_error = ""
-        empty_results = True
         for query in query_list[:5]:
             body: dict = {"textQuery": query, "pageSize": 8}
             if location_bias:
@@ -251,67 +347,38 @@ def places_lookup(
             if r.status_code != 200:
                 last_error = f"HTTP {r.status_code}: {(r.text or '')[:120]}"
                 continue
-            places = r.json().get("places") or []
-            if places:
-                empty_results = False
-            for p in places:
-                uri = (p.get("websiteUri") or "").lower()
-                if host and host in uri:
-                    match = p
-                    break
-            if match:
-                break
-            want = name.lower()
-            for p in places:
-                disp = ((p.get("displayName") or {}).get("text") or "").lower()
-                if want and (want in disp or disp in want or any(
-                    tok and tok in disp for tok in want.split()[:3] if len(tok) > 3
-                )):
-                    match = p
-                    break
-            if match:
-                break
-            if places and not match:
-                # Keep scanning other queries before accepting first hit
+            for p in r.json().get("places") or []:
+                candidates.append(p)
+
+        # Deduplicate by display name + address
+        uniq: list[dict] = []
+        seen_p: set[str] = set()
+        for p in candidates:
+            disp = ((p.get("displayName") or {}).get("text") or "").lower()
+            addr = (p.get("formattedAddress") or "").lower()
+            key_p = f"{disp}|{addr}"
+            if key_p in seen_p:
                 continue
-        if not match and not empty_results:
-            # Last resort: first result from best query
-            r = requests.post(
-                "https://places.googleapis.com/v1/places:searchText",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Goog-Api-Key": key,
-                    "X-Goog-FieldMask": field_mask,
-                },
-                json={
-                    "textQuery": query_list[0],
-                    "pageSize": 5,
-                    **({"locationBias": location_bias} if location_bias else {}),
-                },
-                timeout=30,
-            )
-            if r.status_code == 200:
-                places = r.json().get("places") or []
-                if places:
-                    match = places[0]
+            seen_p.add(key_p)
+            uniq.append(p)
+
+        ranked = sorted(uniq, key=_score_place, reverse=True)
+        match = None
+        if ranked and _score_place(ranked[0]) >= 40:
+            match = ranked[0]
+        # Prefer any host-matching candidate even if not first after soft ranking
+        for p in ranked:
+            uri = (p.get("websiteUri") or "").lower()
+            if host and host in uri and not _places_types_suspicious(p.get("types")):
+                match = p
+                break
 
         if not match:
+            err = last_error or "No confident Places match for this business website/name"
             if gbp_name or gbp_url:
-                return {
-                    "ok": True,
-                    "partial": True,
-                    "source": "portal_gbp",
-                    "name": name,
-                    "address": (city or "").strip(),
-                    "rating": None,
-                    "review_count": None,
-                    "phone": "",
-                    "website": website,
-                    "maps_uri": gbp_url or "",
-                    "types": [],
-                    "error": last_error or "Places API returned no matching listing",
-                }
-            return {"ok": False, "error": last_error or "No listing found"}
+                return _portal_partial(err)
+            return {"ok": False, "error": err}
+
         return {
             "ok": True,
             "partial": False,
@@ -328,20 +395,7 @@ def places_lookup(
         }
     except Exception as e:
         if gbp_name or gbp_url:
-            return {
-                "ok": True,
-                "partial": True,
-                "source": "portal_gbp",
-                "name": name,
-                "address": (city or "").strip(),
-                "rating": None,
-                "review_count": None,
-                "phone": "",
-                "website": website,
-                "maps_uri": gbp_url or "",
-                "types": [],
-                "error": f"{type(e).__name__}: {e}"[:200],
-            }
+            return _portal_partial(f"{type(e).__name__}: {e}"[:200])
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
 
 
@@ -455,6 +509,23 @@ def gsc_site_url_candidates(site_url: str) -> list[str]:
     return out
 
 
+def _is_useful_gsc_query(query: str) -> bool:
+    """Drop spam, foreign-script noise, and ultra-low-signal GSC queries."""
+    q = (query or "").strip()
+    if len(q) < 3 or len(q) > 80:
+        return False
+    # Mostly non-Latin (e.g. accidental foreign calculator queries)
+    latin = len(re.findall(r"[A-Za-z0-9]", q))
+    if latin < max(3, int(len(q) * 0.5)):
+        return False
+    # Obvious junk / navigation debris
+    if re.search(r"https?://|www\.|@", q, re.I):
+        return False
+    if re.fullmatch(r"[\d\W_]+", q):
+        return False
+    return True
+
+
 def fetch_search_console(site_url: str, *, gsc_override: str | None = None) -> dict:
     secret = gsc_secret()
     if not secret:
@@ -519,7 +590,7 @@ def fetch_search_console(site_url: str, *, gsc_override: str | None = None) -> d
             "startDate": start.isoformat(),
             "endDate": end.isoformat(),
             "dimensions": ["query"],
-            "rowLimit": 15,
+            "rowLimit": 25,
         }
         q_resp = requests.post(
             f"https://www.googleapis.com/webmasters/v3/sites/{quote(chosen, safe='')}/searchAnalytics/query",
@@ -539,6 +610,8 @@ def fetch_search_console(site_url: str, *, gsc_override: str | None = None) -> d
         for row in rows:
             keys = row.get("keys") or []
             query = keys[0] if keys else ""
+            if not _is_useful_gsc_query(query):
+                continue
             pos = row.get("position")
             queries.append(
                 {
@@ -549,6 +622,12 @@ def fetch_search_console(site_url: str, *, gsc_override: str | None = None) -> d
                     "ctr": row.get("ctr"),
                 }
             )
+        # Prefer queries with real engagement, then impressions
+        queries.sort(
+            key=lambda q: (q.get("clicks") or 0, q.get("impressions") or 0),
+            reverse=True,
+        )
+        queries = queries[:15]
         total_clicks = sum(q.get("clicks", 0) for q in queries)
         total_impressions = sum(q.get("impressions", 0) for q in queries)
         return {

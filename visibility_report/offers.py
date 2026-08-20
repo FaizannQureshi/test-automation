@@ -148,6 +148,20 @@ _PATH_NOISE_TOKENS = (
     "tips",
     "explained",
     "pathway",  # often "understanding the … pathway" articles
+    "terms-of-service",
+    "terms-of-use",
+    "terms-and-conditions",
+    "privacy-policy",
+    "cookie-policy",
+    "disclaimer",
+    "accessibility",
+    "login",
+    "sign-in",
+    "signup",
+    "sign-up",
+    "cart",
+    "checkout",
+    "unsubscribe",
 )
 
 
@@ -193,7 +207,13 @@ def _path_has_service_hint(path: str) -> bool:
     # Year in slug → usually a dated guide/article
     if re.search(r"20[2-3]\d", p):
         return False
-    return any(h in p for h in _SERVICE_PATH_HINTS)
+    # Neutralize legal phrases that contain the substring "service"
+    p_norm = (
+        p.replace("terms-of-service", " ")
+        .replace("terms_of_service", " ")
+        .replace("customer-service", " ")
+    )
+    return any(h in p_norm for h in _SERVICE_PATH_HINTS)
 
 
 def _path_offer_priority(path: str) -> int:

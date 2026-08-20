@@ -62,12 +62,12 @@ Unlike PageSpeed, **Search Console and GA4 Data APIs require OAuth**, not a plai
 
 | Section | Source |
 |---|---|
-| Site health | PageSpeed Insights |
+| Site health | PageSpeed Insights (skips legal/utility URLs like terms/privacy) |
 | Search sample | Gemini + Google Search grounding |
-| Search Console metrics | GSC searchAnalytics (28 days) when auth succeeds |
+| Search Console metrics | GSC searchAnalytics (28 days); spam/non-Latin queries filtered |
 | Analytics | GA4 runReport sessions/users (28 days) when auth succeeds |
-| Listings | Places API |
-| Offers | Portal `Services` field → schema → sitemap service URLs → Gemini (never raw H2/H3 slogans) |
+| Listings | Places API with website/name confidence scoring (+ portal GBP fallback) |
+| Offers | Portal `Services` field → schema → sitemap service URLs → Gemini refine |
 
 ## Pilot clients
 
