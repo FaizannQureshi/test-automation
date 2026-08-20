@@ -100,4 +100,4 @@ If `client_id` is set in config, that id is used directly. If only `website_host
 
 ## After execution
 
-Summarize: pre-flight set/MISSING, client name + resolved `clientId`, report ID, HTML stored, portal enabled, assignment, overall scores, `apiNotes` (`pagespeed`, `gemini`, `places`, `gsc`, `gsc_ok`, `ga`, `ga_ok`, `ga_property`, `service_account_email`, `search_method`), and any errors. No secret values.
+Summarize: pre-flight set/MISSING, client name + resolved `clientId`, report ID, HTML stored, portal enabled, assignment, overall scores, `apiNotes` (`pagespeed`, `gemini`, `places`, `places_ok`, `places_partial`, `gsc`, `gsc_ok`, `ga`, `ga_ok`, `ga_property`, `service_account_email`, `search_method`), and any errors. No secret values.

@@ -71,6 +71,15 @@ _OFFER_TOOL_NOISE = re.compile(
     r")\b"
 )
 
+# Blog / guide style titles (sitemap slugs that look like articles)
+_OFFER_CONTENT_NOISE = re.compile(
+    r"(?i)\b("
+    r"myths?|guide|understanding|holding\s+back|what\s+is|how\s+to|"
+    r"tips?|checklist|explained|vs\.?|versus|202[0-9]|blog|"
+    r"everything\s+you|reasons?\s+why|top\s+\d+"
+    r")\b"
+)
+
 # Match only inside URL path (never the hostname — avoids "loan" in amydebuskhomeloans.com)
 _SERVICE_PATH_HINTS = (
     "service",
@@ -130,21 +139,36 @@ _PATH_NOISE_TOKENS = (
     "homebuyer-resources",
     "home-buyers-check",
     "free-home-value",
+    "myths",
+    "guide",
+    "understanding",
+    "holding-back",
+    "what-is",
+    "how-to",
+    "tips",
+    "explained",
+    "pathway",  # often "understanding the … pathway" articles
 )
 
 
 def looks_like_offer_name(text: str) -> bool:
     t = re.sub(r"\s+", " ", (text or "").strip())
-    if len(t) < 3 or len(t) > 90:
+    if len(t) < 3 or len(t) > 70:
         return False
     if _OFFER_NOISE.match(t):
         return False
     if _OFFER_TOOL_NOISE.search(t):
         return False
+    if _OFFER_CONTENT_NOISE.search(t):
+        return False
     if t.endswith("?") and not any(k in t.lower() for k in ("loan", "mortgage", "refinance")):
         return False
     words = t.split()
-    if len(words) > 12:
+    # Product names are short; long geo SEO titles are usually articles
+    if len(words) > 8:
+        return False
+    # "In Roseville And Rocklin" style article endings
+    if re.search(r"(?i)\b(in|for)\s+\w+(\s+and\s+\w+)?\s*$", t) and len(words) >= 6:
         return False
     return True
 
@@ -166,6 +190,9 @@ def _path_has_service_hint(path: str) -> bool:
         return False
     if any(tok in p for tok in _PATH_NOISE_TOKENS):
         return False
+    # Year in slug → usually a dated guide/article
+    if re.search(r"20[2-3]\d", p):
+        return False
     return any(h in p for h in _SERVICE_PATH_HINTS)
 
 
@@ -175,10 +202,11 @@ def _path_offer_priority(path: str) -> int:
     score = 0
     strong = (
         "first-time",
+        "va-home",
         "va-",
         "/va/",
         "fha",
-        "refinance",
+        "refinance-option",
         "self-employed",
         "dscr",
         "reverse-mortgage",
@@ -192,15 +220,19 @@ def _path_offer_priority(path: str) -> int:
         "remodel",
         "construction",
         "mortgage-product",
+        "lender",
     )
     for s in strong:
         if s in p:
             score += 10
-    if "lender" in p or "loan" in p or "mortgage" in p:
-        score += 3
+    if re.search(r"(^|/)(loan|loans|mortgage)s?(/|$)", p):
+        score += 5
     # Prefer shallow product URLs over deep blog-ish paths
     depth = len([x for x in p.split("/") if x])
-    score -= max(0, depth - 1)
+    score -= max(0, depth - 1) * 2
+    # Prefer compact slugs (product pages) over long article slugs
+    slug = p.strip("/").split("/")[-1]
+    score -= max(0, len(slug) - 40) // 5
     return score
 
 
@@ -296,6 +328,64 @@ def offers_from_gemini(brand: str, host: str, homepage_html: str) -> list[dict]:
     return out[:10]
 
 
+def refine_offers_with_gemini(
+    brand: str,
+    host: str,
+    candidates: list[dict],
+    *,
+    city: str | None = None,
+) -> list[dict]:
+    """Ask Gemini to normalize candidate offers into short sellable service names."""
+    if not gemini_key() or not candidates:
+        return candidates
+    from .google_apis import gemini_ask
+
+    lines = []
+    for o in candidates[:16]:
+        name = (o.get("name") or "").strip()
+        if name:
+            lines.append(f"- {name}")
+    if not lines:
+        return candidates
+    loc = f" Location focus: {city}." if city else ""
+    prompt = (
+        f"Business: {brand} ({host}).{loc}\n"
+        "Below are candidate service labels scraped from the website.\n"
+        "Return a cleaned list of up to 10 REAL sellable services/products this business offers.\n"
+        "Rules:\n"
+        "- Short product names only (e.g. 'VA home loans', 'FHA loans', 'Refinance', 'Fix and flip loans').\n"
+        "- Drop blog titles, myths, guides, years, city-stuffed SEO titles, GPT/tools/calculators.\n"
+        "- Merge duplicates; keep the clearest name.\n"
+        "- One service per line, plain text, no numbering, no explanations.\n\n"
+        "Candidates:\n" + "\n".join(lines)
+    )
+    resp = gemini_ask(prompt, use_search=False)
+    raw = resp.get("text") or ""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        name = re.sub(r"^[\d\.\-\*\•]+\s*", "", line).strip().strip("\"'`")
+        if not looks_like_offer_name(name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        # Preserve URL from a close original candidate when possible
+        url = None
+        for o in candidates:
+            on = (o.get("name") or "").lower()
+            if key in on or on in key:
+                url = o.get("url")
+                break
+        row = {"name": name, "kind": "Service", "score": None, "source": "gemini_refine"}
+        if url:
+            row["url"] = url
+        out.append(row)
+    # If model returned nothing usable, keep filtered originals
+    return out[:10] if out else candidates[:10]
+
+
 def discover_offers(
     *,
     client: dict | None,
@@ -306,6 +396,8 @@ def discover_offers(
     homepage_html: str,
 ) -> list[dict]:
     """Resolve real services/products — never treat marketing H2/H3 as offers."""
+    from .portal import primary_city_from_client
+
     portal = offers_from_portal_client(client)
     if portal:
         return portal[:12]
@@ -323,7 +415,6 @@ def discover_offers(
             seen.add(key)
             merged.append(o)
 
-    # Prefer Gemini when sitemap/schema are thin or mostly weak matches
     if len(merged) < 6:
         for o in offers_from_gemini(brand, host, homepage_html):
             key = (o.get("name") or "").lower()
@@ -332,7 +423,12 @@ def discover_offers(
             seen.add(key)
             merged.append(o)
 
-    return merged[:12]
+    if not merged:
+        return []
+
+    city = primary_city_from_client(client)
+    refined = refine_offers_with_gemini(brand, host, merged, city=city)
+    return refined[:12]
 
 
 def service_like_pages(page_urls: list[str], host: str, offers: list[dict] | None = None) -> list[str]:

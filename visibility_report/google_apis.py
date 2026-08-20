@@ -121,6 +121,11 @@ _PLATFORM_COMPETITOR_HOSTS = frozenset(
         "bbb.org",
         "angi.com",
         "thumbtack.com",
+        "moovitapp.com",
+        "connectionincorporated.com",
+        "seo.connectionincorporated.com",
+        "oasbit.com",
+        "fastexpert.com",
     }
 )
 
@@ -170,20 +175,36 @@ def places_lookup(
 ) -> dict:
     key = google_key("PLACES")
     if not key:
+        # Portal GBP still lets us show a partial listings fact
+        if gbp_name or gbp_url:
+            return {
+                "ok": True,
+                "partial": True,
+                "source": "portal_gbp",
+                "name": (gbp_name or business_name or "").strip(),
+                "address": (city or "").strip(),
+                "rating": None,
+                "review_count": None,
+                "phone": "",
+                "website": website,
+                "maps_uri": gbp_url or "",
+                "types": [],
+                "error": "places_api not set",
+            }
         return {"ok": False, "error": "places_api not set"}
     host = site_host(website)
     name = (gbp_name or business_name or "").strip() or host
     queries: list[str] = []
     if name and city:
         queries.append(f"{name} {city}")
-    if name and host:
-        queries.append(f"{name} {host}")
     if name:
+        queries.append(f"{name} mortgage lender")
         queries.append(name)
     if business_name and business_name.strip().lower() != name.lower():
         queries.append(business_name.strip())
+    if city:
+        queries.append(f"{host} {city}")
     queries.append(host)
-    # Dedupe preserving order
     seen_q: set[str] = set()
     query_list = []
     for q in queries:
@@ -191,6 +212,18 @@ def places_lookup(
         if k not in seen_q:
             seen_q.add(k)
             query_list.append(q)
+
+    # Bias search near Primary City when Geocoding works
+    location_bias = None
+    if city:
+        geo = geocode_address(city)
+        if geo.get("ok") and geo.get("lat") is not None and geo.get("lng") is not None:
+            location_bias = {
+                "circle": {
+                    "center": {"latitude": geo["lat"], "longitude": geo["lng"]},
+                    "radius": 25000.0,
+                }
+            }
 
     field_mask = (
         "places.displayName,places.formattedAddress,places.rating,"
@@ -200,7 +233,11 @@ def places_lookup(
     try:
         match = None
         last_error = ""
-        for query in query_list[:4]:
+        empty_results = True
+        for query in query_list[:5]:
+            body: dict = {"textQuery": query, "pageSize": 8}
+            if location_bias:
+                body["locationBias"] = location_bias
             r = requests.post(
                 "https://places.googleapis.com/v1/places:searchText",
                 headers={
@@ -208,13 +245,15 @@ def places_lookup(
                     "X-Goog-Api-Key": key,
                     "X-Goog-FieldMask": field_mask,
                 },
-                json={"textQuery": query, "pageSize": 5},
+                json=body,
                 timeout=30,
             )
             if r.status_code != 200:
-                last_error = f"HTTP {r.status_code}"
+                last_error = f"HTTP {r.status_code}: {(r.text or '')[:120]}"
                 continue
             places = r.json().get("places") or []
+            if places:
+                empty_results = False
             for p in places:
                 uri = (p.get("websiteUri") or "").lower()
                 if host and host in uri:
@@ -222,21 +261,61 @@ def places_lookup(
                     break
             if match:
                 break
-            if not match and places:
-                # Prefer a result whose name overlaps the GBP/business name
-                want = name.lower()
-                for p in places:
-                    disp = ((p.get("displayName") or {}).get("text") or "").lower()
-                    if want and (want in disp or disp in want):
-                        match = p
-                        break
-                if not match:
-                    match = places[0]
+            want = name.lower()
+            for p in places:
+                disp = ((p.get("displayName") or {}).get("text") or "").lower()
+                if want and (want in disp or disp in want or any(
+                    tok and tok in disp for tok in want.split()[:3] if len(tok) > 3
+                )):
+                    match = p
+                    break
+            if match:
                 break
+            if places and not match:
+                # Keep scanning other queries before accepting first hit
+                continue
+        if not match and not empty_results:
+            # Last resort: first result from best query
+            r = requests.post(
+                "https://places.googleapis.com/v1/places:searchText",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Api-Key": key,
+                    "X-Goog-FieldMask": field_mask,
+                },
+                json={
+                    "textQuery": query_list[0],
+                    "pageSize": 5,
+                    **({"locationBias": location_bias} if location_bias else {}),
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                places = r.json().get("places") or []
+                if places:
+                    match = places[0]
+
         if not match:
+            if gbp_name or gbp_url:
+                return {
+                    "ok": True,
+                    "partial": True,
+                    "source": "portal_gbp",
+                    "name": name,
+                    "address": (city or "").strip(),
+                    "rating": None,
+                    "review_count": None,
+                    "phone": "",
+                    "website": website,
+                    "maps_uri": gbp_url or "",
+                    "types": [],
+                    "error": last_error or "Places API returned no matching listing",
+                }
             return {"ok": False, "error": last_error or "No listing found"}
         return {
             "ok": True,
+            "partial": False,
+            "source": "places_api",
             "name": (match.get("displayName") or {}).get("text") or name,
             "address": match.get("formattedAddress") or "",
             "rating": match.get("rating"),
@@ -248,6 +327,21 @@ def places_lookup(
             "query_used": query_list[0] if query_list else name,
         }
     except Exception as e:
+        if gbp_name or gbp_url:
+            return {
+                "ok": True,
+                "partial": True,
+                "source": "portal_gbp",
+                "name": name,
+                "address": (city or "").strip(),
+                "rating": None,
+                "review_count": None,
+                "phone": "",
+                "website": website,
+                "maps_uri": gbp_url or "",
+                "types": [],
+                "error": f"{type(e).__name__}: {e}"[:200],
+            }
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
 
 
@@ -265,7 +359,14 @@ def geocode_address(address: str) -> dict:
         if data.get("status") != "OK":
             return {"ok": False}
         loc = data["results"][0]
-        return {"ok": True, "formatted": loc.get("formatted_address"), "place_id": loc.get("place_id")}
+        geometry = (loc.get("geometry") or {}).get("location") or {}
+        return {
+            "ok": True,
+            "formatted": loc.get("formatted_address"),
+            "place_id": loc.get("place_id"),
+            "lat": geometry.get("lat"),
+            "lng": geometry.get("lng"),
+        }
     except Exception:
         return {"ok": False}
 

@@ -194,16 +194,22 @@ def audit_visibility(
         gbp_url=gbp_url_from_client(client),
         city=city,
     )
-    geocoded = geocode_address(places.get("address", "")) if places.get("ok") else {"ok": False}
+    geocoded = geocode_address(places.get("address", "")) if places.get("ok") and places.get("address") else {"ok": False}
     listings_score = 0
     if places.get("ok"):
-        listings_score = 50
-        if places.get("website") and host in site_host(places["website"]):
-            listings_score += 25
-        if places.get("rating"):
-            listings_score += 15
-        if places.get("review_count"):
-            listings_score += 10
+        if places.get("partial"):
+            # Portal has GBP on file but Places API did not fully confirm
+            listings_score = 40
+            if places.get("maps_uri"):
+                listings_score += 10
+        else:
+            listings_score = 50
+            if places.get("website") and host in site_host(places["website"]):
+                listings_score += 25
+            if places.get("rating"):
+                listings_score += 15
+            if places.get("review_count"):
+                listings_score += 10
     listings_score = clamp_score(listings_score)
 
     # Search Console + Google Analytics (Runtime Secrets: search_console_api, analytics_data_api)
@@ -219,15 +225,59 @@ def audit_visibility(
                     "branded/site traffic in the last 28 days."
                 )
 
+    # Prefer Search Console queries in the Search table (real 28-day data)
+    if gsc_data.get("ok") and gsc_data.get("queries"):
+        gsc_rows: list[dict] = []
+        for gq in gsc_data["queries"][:8]:
+            qtext = (gq.get("query") or "").strip()
+            if not qtext:
+                continue
+            pos = gq.get("position")
+            pos_i = int(round(pos)) if isinstance(pos, (int, float)) else None
+            clicks = gq.get("clicks") or 0
+            impr = gq.get("impressions") or 0
+            score = 0
+            if pos_i:
+                if pos_i <= 3:
+                    score = clamp_score(100 - (pos_i - 1) * 12)
+                elif pos_i <= 10:
+                    score = clamp_score(70 - (pos_i - 4) * 5)
+                elif pos_i <= 20:
+                    score = clamp_score(30 - (pos_i - 11) * 2)
+            gsc_rows.append(
+                {
+                    "query": qtext,
+                    "score": score,
+                    "position": pos_i,
+                    "found": bool(pos_i and pos_i <= 20),
+                    "note": (
+                        f"Search Console · avg position {pos:.1f} · {clicks} clicks · "
+                        f"{impr} impressions (28 days)"
+                        if isinstance(pos, (int, float))
+                        else f"Search Console · {clicks} clicks · {impr} impressions (28 days)"
+                    ),
+                    "branded": brand.lower() in qtext.lower(),
+                    "source": "gsc",
+                }
+            )
+        # Keep a few Gemini category samples that aren't already covered by GSC
+        gsc_qset = {r["query"].lower() for r in gsc_rows}
+        gemini_extra = [
+            r for r in search_obs if r.get("query", "").lower() not in gsc_qset and not r.get("branded")
+        ][:4]
+        search_obs = gsc_rows + gemini_extra
+        search_method = "Search Console (28-day) + Gemini sample"
+
     # Component scores
-    search_score = score_from_ratio(first_page_hits, len(queries))
+    search_score = score_from_ratio(first_page_hits, len(queries)) if queries else 0
     if gsc_data.get("ok") and gsc_data.get("queries"):
         gsc_on_page = sum(
             1 for q in gsc_data["queries"][:10] if (q.get("position") or 99) <= 10
         )
         gsc_score = score_from_ratio(gsc_on_page, min(len(gsc_data["queries"]), 10))
-        search_score = max(search_score, gsc_score)
-        if search_method.startswith("Gemini"):
+        # Weight GSC more heavily when available
+        search_score = clamp_score(search_score * 0.35 + gsc_score * 0.65) if first_page_hits else gsc_score
+        if "Search Console" not in search_method:
             search_method = "Gemini sample + Search Console (28-day)"
     ai_score = score_from_ratio(gemini_mentions, len(ai_prompts))
 
@@ -369,7 +419,7 @@ def audit_visibility(
             "value": f"{first_page_hits} of {len(queries)}",
             "status": metric_status("higher_is_better", first_page_hits, good=7, warn=3),
             "note": (
-                f"Web-search sample via {search_method}."
+                f"Gemini web-search sample. Search table prefers Search Console when connected ({search_method})."
                 if gsc_data.get("ok")
                 else f"Web-search sample via {search_method}. Not Search Console ranks."
             ),
@@ -439,25 +489,46 @@ def audit_visibility(
     if places.get("ok"):
         rc = places.get("review_count")
         rt = places.get("rating")
+        if places.get("partial"):
+            other_facts.append(
+                {
+                    "label": "Google Business Profile",
+                    "status": "Watch",
+                    "detail": (
+                        f"On file in portal as “{places.get('name') or 'GBP'}”"
+                        + (f" · {places.get('maps_uri')}" if places.get("maps_uri") else "")
+                        + ". Places API did not fully confirm ratings/NAP."
+                    ),
+                }
+            )
+        else:
+            other_facts.append(
+                {
+                    "label": "Google Business Profile",
+                    "status": "On track" if rc else "Watch",
+                    "detail": (
+                        f"{rt} from {rc} reviews — {places.get('name')}"
+                        if rt and rc
+                        else places.get("name") or "Listing found"
+                    ),
+                }
+            )
+            if geocoded.get("ok"):
+                other_facts.append(
+                    {
+                        "label": "Listing address (Geocoding)",
+                        "status": "On track",
+                        "detail": geocoded.get("formatted") or places.get("address") or "",
+                    }
+                )
+    elif gbp_name_from_client(client) or gbp_url_from_client(client):
         other_facts.append(
             {
                 "label": "Google Business Profile",
-                "status": "On track" if rc else "Watch",
-                "detail": (
-                    f"{rt} from {rc} reviews — {places.get('name')}"
-                    if rt and rc
-                    else places.get("name") or "Listing found"
-                ),
+                "status": "Watch",
+                "detail": places.get("error") or "Portal GBP present but Places lookup failed.",
             }
         )
-        if geocoded.get("ok"):
-            other_facts.append(
-                {
-                    "label": "Listing address (Geocoding)",
-                    "status": "On track",
-                    "detail": geocoded.get("formatted") or places.get("address") or "",
-                }
-            )
     if gsc_data.get("ok"):
         other_facts.append(
             {
@@ -717,6 +788,9 @@ def audit_visibility(
             "pagespeed": bool(google_key("PAGESPEED")),
             "gemini": bool(gemini_key()),
             "places": bool(google_key("PLACES")),
+            "places_ok": bool(places.get("ok")) and not places.get("partial"),
+            "places_partial": bool(places.get("partial")),
+            "places_error": (places.get("error") or "")[:160],
             "geocoding": bool(google_key("GEOCODING")),
             "search_method": search_method,
         },
