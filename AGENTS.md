@@ -1,6 +1,6 @@
 # test-automation
 
-Weekly Connection Inc client **visibility reports** via `weekly_seo_report.py` (Oasbit-style template).
+Weekly Connection Inc client **visibility reports**.
 
 ## Run
 
@@ -9,7 +9,25 @@ pip install -r requirements.txt
 python3 weekly_seo_report.py
 ```
 
+`weekly_seo_report.py` is a thin entrypoint. All logic is in `visibility_report/`.
+
 Automation prompt: [AUTOMATION_PROMPT.md](./AUTOMATION_PROMPT.md)
+
+## Package layout
+
+| Module | Responsibility |
+|---|---|
+| `visibility_report/config.py` | Pilots list, dates, portal API base URL |
+| `visibility_report/env.py` | Runtime Secret env var names |
+| `visibility_report/portal.py` | Portal HTTP + client custom fields |
+| `visibility_report/crawl.py` | Homepage fetch, HTML parse, robots, sitemap |
+| `visibility_report/offers.py` | Real services (portal → schema → sitemap → Gemini) |
+| `visibility_report/google_apis.py` | PageSpeed, Places, Geocoding, Gemini, GSC, GA4 |
+| `visibility_report/scoring.py` | Search/AI query builders + score helpers |
+| `visibility_report/audit.py` | End-to-end visibility audit |
+| `visibility_report/report_html.py` | Oasbit-style RICH_TEXT HTML |
+| `visibility_report/publish.py` | Create + assign portal reports |
+| `visibility_report/main.py` | Pilot loop + JSON summary |
 
 ## v1 Runtime Secrets
 
@@ -20,36 +38,26 @@ Automation prompt: [AUTOMATION_PROMPT.md](./AUTOMATION_PROMPT.md)
 | `gemini_api` | Gemini + Google Search grounding |
 | `places_api` | Places API (Google Business Profile) |
 | `geocoding_api` | Geocoding API |
-| `search_console_api` | Search Console API (see note below) |
-| `analytics_data_api` | Google Analytics Data API (see note below) |
-| `analytics_property_id` | GA4 property ID (`123456789` or `properties/123456789`) |
+| `search_console_api` | Search Console API (service account JSON) |
+| `analytics_data_api` | Google Analytics Data API (service account JSON) |
 | `custom_search_api` | Not used (full-web CSE unavailable for new engines) |
 | `maps_javascript_api` | Not used (browser-only) |
 
-Optional: `GEMINI_MODEL` (default `gemini-3.6-flash`).
+Optional: `GEMINI_MODEL` (default `gemini-3.6-flash`). Optional global fallback: `analytics_property_id` (prefer per-client portal fields).
 
 ### Per-client overrides (portal custom fields)
 
-When the global `analytics_property_id` env secret is for a different site, set these on the **client record**:
-
 | Custom field name | Example | Purpose |
 |---|---|---|
-| `GA4 Property ID` | `365023674` | Client’s GA4 property (must match the site you audit) |
-| `Search Console Site URL` | `sc-domain:adamzmortgage.com` or `https://www.adamzmortgage.com/` | Exact GSC property URL |
+| `Services` | `FHA loans, Refinance, VA loans` | Preferred Offers + search queries (optional) |
+| `GA4 URL` / `GA4 Property ID` | analytics admin URL or `458571033` | Client’s GA4 property |
+| `GSC URL` / `Search Console Site URL` | GSC users URL or `sc-domain:example.com` | Exact GSC property |
+| `GBP Name` / `GBP URL` | Profile name or business.google.com link | Improves Listings / Places match |
+| `Primary City` / `Main Keyword` | `Roseville, CA` / `mortgage lender` | Better local search queries |
 
-Global env secrets are the fallback when client fields are empty.
+### Search Console + Analytics credentials
 
-Unlike PageSpeed, **Search Console and GA4 Data APIs require OAuth**, not a plain API key in the URL.
-
-Store **service account JSON** (minified one line) in Runtime Secrets `search_console_api` and `analytics_data_api`, then:
-
-1. Enable **Search Console API** and **Google Analytics Data API** in GCP.
-2. Add the service account email to each client’s **Search Console** property (Settings → Users).
-3. Add the same email to the client’s **GA4** property (Admin → Property access management).
-4. Set `analytics_property_id` to that client’s GA4 property ID.
-
-If you only store a short GCP API key string, the script will detect the secret as set but `gsc_ok` / `ga_ok` will be false with an auth error in `apiNotes`.
-
+Unlike PageSpeed, **Search Console and GA4 Data APIs require OAuth**, not a plain API key. Store **service account JSON** in `search_console_api` / `analytics_data_api`, and invite that JSON’s `client_email` on each client’s GSC + GA. Property IDs come from the portal client fields (no global `analytics_property_id` required).
 ## Data sources
 
 | Section | Source |
@@ -59,16 +67,22 @@ If you only store a short GCP API key string, the script will detect the secret 
 | Search Console metrics | GSC searchAnalytics (28 days) when auth succeeds |
 | Analytics | GA4 runReport sessions/users (28 days) when auth succeeds |
 | Listings | Places API |
-| Content / structure | Homepage crawl + sitemap |
+| Offers | Portal `Services` field → schema → sitemap service URLs → Gemini (never raw H2/H3 slogans) |
 
 ## Pilot clients
 
-```python
-PILOTS = [
-    ("Adam Zeman", "cmkoitqae0001ib04j8hrefa9"),
-]
-```
+Configured in `visibility_report/config.py`. Current pilot: **Amy DeBusk** (`amydebuskhomeloans.com`), resolved by website host at runtime.
 
+### GSC / GA access (important)
+
+The weekly job authenticates with the **service account email inside** your `search_console_api` / `analytics_data_api` JSON (`client_email`, usually `…@….iam.gserviceaccount.com`).
+
+Adding `ai.seo@connectionincorporated.com` in the Google UI only helps if that address is the same as `client_email` in the JSON. If the JSON is a GCP service account, invite **that** `client_email` (not the human Workspace inbox) as:
+
+- Search Console → Users → Restricted or Full
+- GA4 → Account (or Property) access → Viewer
+
+The run summary prints `service_account_email` in `apiNotes` so you know exactly which address to invite.
 ## Template reference
 
 [Oasbit visibility report](https://oasbit.com/114/4757a659-1a96-4425-947d-4ffae49f87c2)
