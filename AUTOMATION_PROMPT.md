@@ -10,15 +10,36 @@ Run the weekly Connection Inc client visibility report job using the **existing 
 
 - Use the **existing v1 environment only**. Do not create a new environment.
 - Do not create a new repository.
-- Do not create a new Python script.
-- Do not recreate the report logic in this prompt — all logic lives in `weekly_seo_report.py`.
-- Run the committed `weekly_seo_report.py` from the repository root.
+- Do not create a new Python script or temporary replacement implementation.
+- Do **not** recreate report logic in this prompt — logic lives in the `visibility_report/` package; `weekly_seo_report.py` is the entrypoint only.
+- Run the committed job from the repository root: `python3 weekly_seo_report.py`
 - Install dependencies using `requirements.txt` if needed.
 - **Never print, expose, echo, or log any API keys, tokens, or other secrets.**
 
+## Repository layout
+
+```
+weekly_seo_report.py          # thin entrypoint (run this)
+visibility_report/
+  config.py                   # pilots, dates, API base URL
+  env.py                      # Runtime Secret name resolution
+  portal.py                   # Connection Inc portal API + client fields
+  crawl.py                    # fetch, HTML parse, robots, sitemap
+  offers.py                   # real service/product discovery
+  google_apis.py              # PageSpeed, Places, Geocoding, Gemini, GSC, GA4
+  scoring.py                  # query builders + score helpers
+  audit.py                    # full visibility audit orchestration
+  report_html.py              # Oasbit-style RICH_TEXT HTML
+  publish.py                  # POST/PATCH reports to portal
+  main.py                     # pilot loop + summary JSON
+requirements.txt
+```
+
+Do not modify package modules unless the run fails due to a committed bug.
+
 ## Runtime Secrets (v1 environment)
 
-Confirm these are on **this same v1 environment** before running. Names must match exactly:
+Confirm these are on **this same v1 environment**. Names must match exactly:
 
 | Secret name | Purpose |
 |---|---|
@@ -52,8 +73,9 @@ If core Google secrets show **MISSING**, report that Environment Runtime Secrets
 1. `pip install -r requirements.txt`
 2. Pre-flight check (above)
 3. `git pull` on `cursor/setup-dev-environment-06c4` if behind remote
-4. `python3 weekly_seo_report.py`
-5. Pilot client only (Adam Zeman). Creates new RICH_TEXT report; do not overwrite prior reports.
+4. Confirm `visibility_report/` package exists next to `weekly_seo_report.py`
+5. `python3 weekly_seo_report.py`
+6. Pilot client only (Adam Zeman). Creates new RICH_TEXT report; do not overwrite prior reports.
 
 ## After execution
 
