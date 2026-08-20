@@ -22,4 +22,9 @@ PILOTS = [
         "client_id": None,  # resolved at runtime by website_host
         "website_host": "amydebuskhomeloans.com",
     },
+    {
+        "name": "Chris Nieberlein",
+        "client_id": None,
+        "website_host": "chrisnieberlein.com",
+    },
 ]

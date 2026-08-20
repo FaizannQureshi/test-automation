@@ -71,7 +71,7 @@ Unlike PageSpeed, **Search Console and GA4 Data APIs require OAuth**, not a plai
 
 ## Pilot clients
 
-Configured in `visibility_report/config.py`. Current pilot: **Amy DeBusk** (`amydebuskhomeloans.com`), resolved by website host at runtime.
+Configured in `visibility_report/config.py`. Current pilots: **Amy DeBusk** (`amydebuskhomeloans.com`), **Chris Nieberlein** (`chrisnieberlein.com`), resolved by website host at runtime.
 
 ### GSC / GA access (important)
 

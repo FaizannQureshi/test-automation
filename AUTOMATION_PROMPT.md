@@ -74,13 +74,16 @@ If `PORTAL_API_KEY` or core Google secrets show **MISSING**, report that Environ
 
 ## Pilot resolution (no hard-coded portal client id required)
 
-`visibility_report/config.py` lists pilots. Current pilot is Amy DeBusk by **website host**:
+`visibility_report/config.py` lists pilots. Current pilots (resolved by website host via portal API):
 
-- `website_host: amydebuskhomeloans.com`
-- At runtime the job calls the portal API (`PORTAL_API_KEY`), finds the client whose Credentials → Website URL matches that host, then reads:
+- Amy DeBusk — `website_host: amydebuskhomeloans.com`
+- Chris Nieberlein — `website_host: chrisnieberlein.com`
+
+At runtime the job calls the portal API (`PORTAL_API_KEY`), finds each client whose Credentials → Website URL matches that host, then reads:
   - Website URL
   - `GA4 URL` / `GA4 Property ID` → Analytics property
   - `GSC URL` / Search Console Site URL → Search Console property
+  - `GBP Name` / `GBP URL` → Listings / Places
 
 If `client_id` is set in config, that id is used directly. If only `website_host` is set, resolve via portal list — do **not** invent a client id in the prompt.
 
@@ -91,7 +94,7 @@ If `client_id` is set in config, that id is used directly. If only `website_host
 3. `git pull` on `cursor/setup-dev-environment-06c4` if behind remote
 4. Confirm `visibility_report/` package exists next to `weekly_seo_report.py`
 5. `python3 weekly_seo_report.py`
-6. Pilot client only (Amy DeBusk). Creates a new RICH_TEXT report; do not overwrite prior reports.
+6. Pilot clients (Amy DeBusk + Chris Nieberlein). Creates a new RICH_TEXT report per client; do not overwrite prior reports.
 7. Expect `apiNotes.service_account_email` like `seo-report-service@….iam.gserviceaccount.com`. That email must already have GSC + GA Viewer (or better) on the client’s properties.
 8. Light QA after the run (do not rewrite report HTML):
    - Offers should look like sellable services (not GPT/calc/planner tools).
